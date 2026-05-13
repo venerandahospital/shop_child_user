@@ -1,16 +1,29 @@
 # child_ui_app
 
-A new Flutter project.
+Flutter client for the child shop UI: sales, cart, barcode scanning, local database, and remote sync.
 
-## Getting Started
+## Requirements
 
-This project is a starting point for a Flutter application.
+- [Flutter](https://docs.flutter.dev/get-started/install) (Dart SDK `>=3.3.0 <4.0.0`, see `pubspec.yaml`)
 
-A few resources to get you started if this is your first Flutter project:
+## Run locally
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+```bash
+flutter pub get
+flutter run
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Use `flutter devices` to pick a target if more than one device is connected.
+
+## Analyze / test
+
+```bash
+dart analyze
+flutter test
+```
+
+## Repository
+
+Remote: `https://github.com/venerandahospital/shop_child_user.git`
+
+For general Flutter help, see the [Flutter documentation](https://docs.flutter.dev/).
