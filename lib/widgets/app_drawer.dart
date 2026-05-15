@@ -4,6 +4,7 @@ import '../services/item_image_upload_service.dart';
 import '../screens/child_login_screen.dart';
 import '../screens/profile_screen.dart';
 import '../screens/inventory_screen.dart';
+import '../screens/special_items_screen.dart';
 import '../screens/categories_screen.dart';
 import '../screens/unit_management_screen.dart';
 import '../screens/sales_screen.dart';
@@ -264,6 +265,18 @@ class _AppDrawerState extends State<AppDrawer> {
                     Navigator.of(context).pop();
                     Navigator.of(context).push(
                       MaterialPageRoute(builder: (_) => const InventoryScreen()),
+                    );
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.star_outline, color: Color(0xFF2563eb)),
+                  title: const Text('Special items'),
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const SpecialItemsScreen(),
+                      ),
                     );
                   },
                 ),

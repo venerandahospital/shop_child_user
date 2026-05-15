@@ -20,6 +20,8 @@ class Item {
   final double stockQty;
   final double reorderLevel;
   final double restockTo;
+  final double specialRollMetersTotal;
+  final double specialRollMetersSold;
   final DateTime createdAt;
 
   Item({
@@ -43,8 +45,15 @@ class Item {
     this.stockQty = 0,
     this.reorderLevel = 0,
     this.restockTo = 0,
+    this.specialRollMetersTotal = 0,
+    this.specialRollMetersSold = 0,
     DateTime? createdAt,
   }) : createdAt = createdAt ?? DateTime.now();
+
+  double get specialRollMetersRemaining {
+    final left = specialRollMetersTotal - specialRollMetersSold;
+    return left < 0 ? 0 : left;
+  }
 
   bool get isOutOfStock => stockQty <= 0;
 
@@ -72,6 +81,14 @@ class Item {
       stockQty: (map['stock_qty'] as num?)?.toDouble() ?? 0,
       reorderLevel: (map['reorder_level'] as num?)?.toDouble() ?? 0,
       restockTo: (map['restock_to'] as num?)?.toDouble() ?? 0,
+      specialRollMetersTotal:
+          (map['special_roll_meters_total'] as num?)?.toDouble() ??
+          (map['specialRollMetersTotal'] as num?)?.toDouble() ??
+          0,
+      specialRollMetersSold:
+          (map['special_roll_meters_sold'] as num?)?.toDouble() ??
+          (map['specialRollMetersSold'] as num?)?.toDouble() ??
+          0,
       createdAt: DateTime.tryParse(map['created_at'] as String? ?? '') ??
           DateTime.now(),
     );
@@ -99,6 +116,8 @@ class Item {
       'stock_qty': stockQty,
       'reorder_level': reorderLevel,
       'restock_to': restockTo,
+      'special_roll_meters_total': specialRollMetersTotal,
+      'special_roll_meters_sold': specialRollMetersSold,
       'created_at': createdAt.toIso8601String(),
     };
   }
@@ -124,6 +143,8 @@ class Item {
     double? stockQty,
     double? reorderLevel,
     double? restockTo,
+    double? specialRollMetersTotal,
+    double? specialRollMetersSold,
     DateTime? createdAt,
   }) {
     return Item(
@@ -147,6 +168,10 @@ class Item {
       stockQty: stockQty ?? this.stockQty,
       reorderLevel: reorderLevel ?? this.reorderLevel,
       restockTo: restockTo ?? this.restockTo,
+      specialRollMetersTotal:
+          specialRollMetersTotal ?? this.specialRollMetersTotal,
+      specialRollMetersSold:
+          specialRollMetersSold ?? this.specialRollMetersSold,
       createdAt: createdAt ?? this.createdAt,
     );
   }

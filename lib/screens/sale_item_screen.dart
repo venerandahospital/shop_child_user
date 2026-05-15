@@ -230,10 +230,12 @@ class _SaleItemScreenState extends State<SaleItemScreen>
       final cat = (e.category ?? '').toLowerCase();
       final sku = (e.sku ?? '').toLowerCase();
       final barcode = (e.barcode ?? '').toLowerCase();
+      final shelf = (e.shelfNumber ?? '').toLowerCase();
       return name.contains(q) ||
           cat.contains(q) ||
           sku.contains(q) ||
-          barcode.contains(q);
+          barcode.contains(q) ||
+          shelf.contains(q);
     }).toList();
   }
 
@@ -402,6 +404,14 @@ class _SaleItemScreenState extends State<SaleItemScreen>
           title: Text.rich(
             TextSpan(
               children: [
+                if ((item.shelfNumber ?? '').trim().isNotEmpty)
+                  TextSpan(
+                    text: '${item.shelfNumber!.trim()} · ',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ),
                 TextSpan(
                   text: toTitleCaseWords(item.name),
                   style: const TextStyle(
@@ -531,7 +541,7 @@ class _SaleItemScreenState extends State<SaleItemScreen>
                   focusNode: _searchFocusNode,
                   autofocus: kIsWeb,
                   decoration: InputDecoration(
-                    labelText: 'Search name or barcode',
+                    labelText: 'Search name, barcode, SKU, or shelf',
                     hintText: kIsWeb
                         ? 'Type to filter'
                         : 'Optional: type to search the list',

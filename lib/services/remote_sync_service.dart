@@ -4,6 +4,7 @@ import 'dart:async';
 // own) and refreshes [MotherDataCache] so the UI reads mother state in memory.
 import 'auth_service.dart';
 import 'mother_data_cache.dart';
+import '../models/asset.dart';
 import '../models/client.dart';
 import '../models/debt.dart';
 import '../models/debt_payment.dart';
@@ -111,11 +112,61 @@ class RemoteSyncService {
   }
 
   Future<List<Item>> fetchItems() async {
-    final res = await _auth.getRemoteAuthorized(path: '/items');
-    if (res['success'] != true) return <Item>[];
-    final rows = _extractRows(res);
-    MotherDataCache.instance.applyItemsFromRemote(rows);
-    return MotherDataCache.instance.getItems();
+    final pulled = await pullItemsFromMother();
+    return pulled.$3;
+  }
+
+  /// Refreshes [MotherDataCache] from `GET /items` and returns the latest rows.
+  Future<(bool ok, String message, List<Item> items)> pullItemsFromMother() async {
+    return _runQueued(() async {
+      if (!await _auth.isRemoteUser()) {
+        return (false, 'Not connected to mother.', const <Item>[]);
+      }
+      final res = await _auth.getRemoteAuthorized(path: '/items');
+      if (res['success'] != true) {
+        return (
+          false,
+          (res['message'] ?? 'Failed to pull items from mother.').toString(),
+          const <Item>[],
+        );
+      }
+      MotherDataCache.instance.applyItemsFromRemote(_extractRows(res));
+      final items = MotherDataCache.instance.getItems()
+        ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+      return (true, 'Items refreshed from mother.', items);
+    });
+  }
+
+  /// Pushes one special-item outcome to the mother DB and refreshes the item cache.
+  Future<(bool ok, String message)> pushSpecialSaleOutcomeToMother({
+    required int itemId,
+    required bool stillAvailable,
+    required double metersSold,
+  }) async {
+    return _runQueued(() async {
+      if (!await _auth.isRemoteUser()) {
+        return (false, 'Not connected to mother.');
+      }
+      final res = await _auth.applyRemoteSpecialItemSaleOutcomes([
+        {
+          'itemId': itemId,
+          'stillAvailable': stillAvailable,
+          'metersSold': metersSold,
+        },
+      ]);
+      if (res['success'] != true) {
+        return (
+          false,
+          (res['message'] ?? 'Could not update special item stock on mother.')
+              .toString(),
+        );
+      }
+      final rows = _extractRows(res);
+      if (rows.isNotEmpty) {
+        MotherDataCache.instance.applyItemsFromRemote(rows);
+      }
+      return (true, 'Special item stock updated.');
+    });
   }
 
   Future<List<Unit>> fetchUnits() async {
@@ -176,6 +227,10 @@ class RemoteSyncService {
     final res = await _auth.getRemoteAuthorized(path: '/expenses');
     if (res['success'] != true) return <Expense>[];
     return _extractRows(res).map(Expense.fromMap).toList();
+  }
+
+  Future<List<Asset>> fetchAssets() async {
+    return _auth.fetchRemoteAssets();
   }
 
   Future<List<Map<String, Object?>>> fetchStockReceipts() async {

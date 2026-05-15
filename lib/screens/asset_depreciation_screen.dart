@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 
 import '../models/asset.dart';
 import '../services/app_settings_service.dart';
+import '../services/auth_service.dart';
 import '../services/local_db_service.dart';
+import '../services/remote_sync_service.dart';
 import '../utils/number_display.dart';
 import '../utils/text_format.dart';
 import '../widgets/section_page_title.dart';
@@ -18,6 +20,7 @@ class AssetDepreciationScreen extends StatefulWidget {
 
 class _AssetDepreciationScreenState extends State<AssetDepreciationScreen> {
   final _db = LocalDbService.instance;
+  final _auth = AuthService();
   final _appSettings = AppSettingsService.instance;
   final _amountController = TextEditingController();
   final _noteController = TextEditingController();
@@ -49,12 +52,22 @@ class _AssetDepreciationScreenState extends State<AssetDepreciationScreen> {
   }
 
   Future<void> _load() async {
-    final allAssets = await _db.getAssets();
-    final current = allAssets.where((a) => a.id == widget.asset.id).toList();
-    final history = await _db.getAssetDepreciations(widget.asset.id!);
+    if (widget.asset.id == null) return;
+    final isRemote = await _auth.isRemoteUser();
+    Asset? current;
+    List<Map<String, Object?>> history;
+    if (isRemote) {
+      final assets = await RemoteSyncService.instance.fetchAssets();
+      current = assets.where((a) => a.id == widget.asset.id).firstOrNull;
+      history = await _auth.fetchRemoteAssetDepreciations(widget.asset.id!);
+    } else {
+      final allAssets = await _db.getAssets();
+      current = allAssets.where((a) => a.id == widget.asset.id).firstOrNull;
+      history = await _db.getAssetDepreciations(widget.asset.id!);
+    }
     if (!mounted) return;
     setState(() {
-      _asset = current.isEmpty ? widget.asset : current.first;
+      _asset = current ?? widget.asset;
       _history = history;
     });
   }
@@ -63,11 +76,36 @@ class _AssetDepreciationScreenState extends State<AssetDepreciationScreen> {
     final amount = double.tryParse(_amountController.text.trim()) ?? 0;
     if (amount <= 0 || widget.asset.id == null) return;
     setState(() => _saving = true);
-    await _db.addAssetDepreciation(
-      assetId: widget.asset.id!,
-      amount: amount,
-      note: _noteController.text.trim().isEmpty ? null : _noteController.text.trim(),
-    );
+    final note = _noteController.text.trim().isEmpty
+        ? null
+        : _noteController.text.trim();
+    if (await _auth.isRemoteUser()) {
+      final remote = await _auth.postRemoteAssetDepreciation(
+        assetId: widget.asset.id!,
+        amount: amount,
+        note: note,
+      );
+      if (remote['success'] != true) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                (remote['message'] ?? 'Failed to record depreciation on mother')
+                    .toString(),
+              ),
+            ),
+          );
+        }
+        setState(() => _saving = false);
+        return;
+      }
+    } else {
+      await _db.addAssetDepreciation(
+        assetId: widget.asset.id!,
+        amount: amount,
+        note: note,
+      );
+    }
     _amountController.clear();
     _noteController.clear();
     await _load();

@@ -32,7 +32,7 @@ class LocalDbService {
   static const _mainDbName = 'shop_manager_retail_supermarket.db';
   static const _authDbName = 'shop_manager_auth.db';
   static const _legacyDbName = 'shop_manager.db';
-  static const _dbVersion = 29;
+  static const _dbVersion = 30;
   final ValueNotifier<int> transactionVersion = ValueNotifier<int>(0);
   static const _metaBusinessName = 'business_name';
   static const _metaBusinessCode = 'business_code';
@@ -158,6 +158,8 @@ class LocalDbService {
             stock_qty REAL NOT NULL DEFAULT 0,
             reorder_level REAL NOT NULL DEFAULT 0,
             restock_to REAL NOT NULL DEFAULT 0,
+            special_roll_meters_total REAL NOT NULL DEFAULT 0,
+            special_roll_meters_sold REAL NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
           )
         ''');
@@ -726,6 +728,14 @@ class LocalDbService {
               created_at TEXT NOT NULL
             )
           ''');
+        }
+        if (oldVersion < 30) {
+          await db.execute(
+            'ALTER TABLE items ADD COLUMN special_roll_meters_total REAL NOT NULL DEFAULT 0',
+          );
+          await db.execute(
+            'ALTER TABLE items ADD COLUMN special_roll_meters_sold REAL NOT NULL DEFAULT 0',
+          );
         }
       },
       onOpen: (db) async {
@@ -1308,11 +1318,62 @@ class LocalDbService {
 
   // ===== ITEMS =====
 
+  Future<int> applySpecialItemSaleOutcome({
+    required int itemId,
+    required bool stillAvailable,
+    required double metersSold,
+  }) async {
+    final db = await database;
+    final rows = await db.query(
+      'items',
+      where: 'id = ?',
+      whereArgs: [itemId],
+      limit: 1,
+    );
+    if (rows.isEmpty) return 0;
+    final item = Item.fromMap(rows.first);
+    final sold = item.specialRollMetersSold + (metersSold < 0 ? 0 : metersSold);
+    if (!stillAvailable) {
+      final updated = item.copyWith(
+        stockQty: kSpecialItemUnavailableStock,
+        specialRollMetersSold: sold,
+      );
+      final result = await db.update(
+        'items',
+        updated.toMap(),
+        where: 'id = ?',
+        whereArgs: [itemId],
+      );
+      if (result > 0) _notifyDataChanged();
+      return result;
+    }
+    if (!isMeterSoldFixedStockItemName(item.name)) return 0;
+    final updated = item.copyWith(specialRollMetersSold: sold);
+    final result = await db.update(
+      'items',
+      updated.toMap(),
+      where: 'id = ?',
+      whereArgs: [itemId],
+    );
+    if (result > 0) _notifyDataChanged();
+    return result;
+  }
+
   Future<int> upsertItem(Item item) async {
     final db = await database;
-    final itemToSave = isMeterSoldFixedStockItemName(item.name)
-        ? item.copyWith(stockQty: kMeterFixedDisplayStockQty)
-        : item;
+    Item itemToSave = item;
+    if (isMeterSoldFixedStockItemName(item.name)) {
+      if (item.id == null) {
+        itemToSave = item.copyWith(stockQty: kSpecialItemUnavailableStock);
+      } else {
+        final sq = item.stockQty;
+        itemToSave = item.copyWith(
+          stockQty: sq > 0
+              ? kSpecialItemAvailableStock
+              : kSpecialItemUnavailableStock,
+        );
+      }
+    }
     if (itemToSave.id == null) {
       final id = await db.transaction<int>((txn) async {
         var toInsert = itemToSave;
@@ -1682,12 +1743,7 @@ class LocalDbService {
     if (rows.isEmpty) return 0;
     final item = Item.fromMap(rows.first);
     if (isMeterSoldFixedStockItemName(item.name)) {
-      return await db.update(
-        'items',
-        item.copyWith(stockQty: kMeterFixedDisplayStockQty).toMap(),
-        where: 'id = ?',
-        whereArgs: [itemId],
-      );
+      return 0;
     }
     final newQty = item.stockQty + delta;
     if (newQty < 0) return 0;
@@ -2020,14 +2076,20 @@ class LocalDbService {
       final item = Item.fromMap(maps.first);
       final fixedStock = isMeterSoldFixedStockItemName(item.name);
       final oldQty = item.stockQty;
-      final newQty =
-          fixedStock ? kMeterFixedDisplayStockQty : oldQty + quantity;
+      final metresOnRoll = fixedStock ? quantity : 0.0;
+      final receiptQty = fixedStock ? 1.0 : quantity;
+      final newQty = fixedStock
+          ? kSpecialItemAvailableStock
+          : oldQty + quantity;
+      final unitCostForReceipt = fixedStock
+          ? (metresOnRoll > 0 ? effectiveTotal / metresOnRoll : effectiveUnitCost)
+          : effectiveUnitCost;
 
       final receipt = StockReceipt(
         storeId: storeId ?? item.storeId,
         itemId: itemId,
-        quantity: quantity,
-        unitCost: effectiveUnitCost,
+        quantity: receiptQty,
+        unitCost: unitCostForReceipt,
         totalCost: effectiveTotal,
         unitSell: item.sellingPrice,
         oldQty: oldQty,
@@ -2039,11 +2101,19 @@ class LocalDbService {
 
       await txn.insert('stock_receipts', receipt.toMap());
 
-      final updated = item.copyWith(
-        stockQty: newQty,
-        costPrice: effectiveUnitCost,
-        sellingPrice: sellingPrice ?? item.sellingPrice,
-      );
+      final updated = fixedStock
+          ? item.copyWith(
+              stockQty: kSpecialItemAvailableStock,
+              specialRollMetersTotal: metresOnRoll,
+              specialRollMetersSold: 0,
+              costPrice: unitCostForReceipt,
+              sellingPrice: sellingPrice ?? item.sellingPrice,
+            )
+          : item.copyWith(
+              stockQty: newQty,
+              costPrice: effectiveUnitCost,
+              sellingPrice: sellingPrice ?? item.sellingPrice,
+            );
       return txn.update(
         'items',
         updated.toMap(),

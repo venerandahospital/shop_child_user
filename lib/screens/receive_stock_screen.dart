@@ -441,8 +441,8 @@ class _ReceiveStockScreenState extends State<ReceiveStockScreen> {
                           isMeterSoldFixedStockItemName(item.name)) ...[
                         const SizedBox(height: 10),
                         Text(
-                          'Metre item (Ekiveera / carpet / ebinyobwa): stock at hand stays at 1. '
-                          'Enter metres or units received for this receipt (used for cost and history only).',
+                          'Special roll item: stock at hand becomes 1 (one roll). '
+                          'Enter metres/units on this roll below; receipt quantity saved as 1.',
                           style: theme.textTheme.bodySmall?.copyWith(
                             fontWeight: FontWeight.w600,
                             color: Colors.grey[800],

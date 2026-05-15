@@ -8,6 +8,7 @@ import 'package:multicast_dns/multicast_dns.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/asset.dart';
 import '../models/debt.dart';
 import '../models/expense.dart';
 import '../models/loan.dart';
@@ -1277,6 +1278,38 @@ class AuthService {
         .toList();
   }
 
+  Future<List<Asset>> fetchRemoteAssets() async {
+    final res = await getRemoteAuthorized(path: '/assets');
+    if (res['success'] != true) return const [];
+    final rows = res['data'];
+    if (rows is! List) return const [];
+    return rows
+        .map(
+          (e) => e is Map<String, dynamic>
+              ? Asset.fromMap(e)
+              : Asset.fromMap(Map<String, dynamic>.from(e as Map)),
+        )
+        .toList();
+  }
+
+  Future<List<Map<String, Object?>>> fetchRemoteAssetDepreciations(
+    int assetId,
+  ) async {
+    final res = await getRemoteAuthorized(
+      path: '/assets/depreciations?assetId=$assetId',
+    );
+    if (res['success'] != true) return const [];
+    final rows = res['data'];
+    if (rows is! List) return const [];
+    return rows
+        .map(
+          (e) => e is Map<String, Object?>
+              ? e
+              : Map<String, Object?>.from(e as Map),
+        )
+        .toList();
+  }
+
   Future<List<ServiceTransaction>> fetchRemoteServices() async {
     final res = await getRemoteAuthorized(path: '/services');
     if (res['success'] != true) return const [];
@@ -1520,11 +1553,49 @@ class AuthService {
     return postRemoteAuthorized(path: '/sales', body: payload);
   }
 
+  Future<Map<String, dynamic>> applyRemoteSpecialItemSaleOutcomes(
+    List<Map<String, dynamic>> updates,
+  ) {
+    return postRemoteAuthorized(
+      path: '/items/special-sale-outcomes',
+      body: {'updates': updates},
+    );
+  }
+
   Future<Map<String, dynamic>> saveRemoteExpense(Map<String, dynamic> payload) {
     if (_hasRecordId(payload)) {
       return putRemoteAuthorized(path: '/expenses', body: payload);
     }
     return postRemoteAuthorized(path: '/expenses', body: payload);
+  }
+
+  Future<Map<String, dynamic>> saveRemoteAsset(Map<String, dynamic> payload) {
+    if (_hasRecordId(payload)) {
+      return putRemoteAuthorized(path: '/assets', body: payload);
+    }
+    return postRemoteAuthorized(path: '/assets', body: payload);
+  }
+
+  Future<Map<String, dynamic>> deleteRemoteAsset(int assetId) {
+    return postRemoteAuthorized(
+      path: '/assets/delete',
+      body: {'id': assetId},
+    );
+  }
+
+  Future<Map<String, dynamic>> postRemoteAssetDepreciation({
+    required int assetId,
+    required double amount,
+    String? note,
+  }) {
+    return postRemoteAuthorized(
+      path: '/assets/depreciate',
+      body: {
+        'assetId': assetId,
+        'amount': amount,
+        if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+      },
+    );
   }
 
   Future<Map<String, dynamic>> deleteRemoteItem(int itemId) {

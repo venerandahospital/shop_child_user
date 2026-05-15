@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 
 import '../models/asset.dart';
 import '../services/app_settings_service.dart';
+import '../services/auth_service.dart';
 import '../services/local_db_service.dart';
+import '../services/remote_sync_service.dart';
 import '../utils/number_display.dart';
 import '../utils/text_format.dart';
 import '../widgets/section_page_title.dart';
@@ -18,6 +20,7 @@ class AssetsScreen extends StatefulWidget {
 
 class _AssetsScreenState extends State<AssetsScreen> {
   final _db = LocalDbService.instance;
+  final _auth = AuthService();
   final _appSettings = AppSettingsService.instance;
 
   bool _loading = true;
@@ -45,7 +48,9 @@ class _AssetsScreenState extends State<AssetsScreen> {
 
   Future<void> _load() async {
     setState(() => _loading = true);
-    final assets = await _db.getAssets();
+    final assets = await _auth.isRemoteUser()
+        ? await RemoteSyncService.instance.fetchAssets()
+        : await _db.getAssets();
     if (!mounted) return;
     setState(() {
       _assets = assets;
@@ -84,7 +89,22 @@ class _AssetsScreenState extends State<AssetsScreen> {
       ),
     );
     if (confirmed != true) return;
-    await _db.deleteAsset(asset.id!);
+    if (await _auth.isRemoteUser()) {
+      final remote = await _auth.deleteRemoteAsset(asset.id!);
+      if (remote['success'] != true) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              (remote['message'] ?? 'Failed to delete asset on mother').toString(),
+            ),
+          ),
+        );
+        return;
+      }
+    } else {
+      await _db.deleteAsset(asset.id!);
+    }
     await _load();
   }
 

@@ -11,6 +11,7 @@ import '../services/mother_data_cache.dart';
 import '../services/remote_sync_service.dart';
 import '../utils/barcode_utils.dart';
 import '../utils/number_display.dart';
+import '../utils/meter_fixed_stock_items.dart';
 import '../utils/text_format.dart';
 import '../widgets/section_page_title.dart';
 import 'barcode_scan_screen.dart';
@@ -750,6 +751,13 @@ class _InventoryScreenState extends State<InventoryScreen>
                                             context,
                                             'Shelf ${item.shelfNumber!.trim()}',
                                             Colors.teal,
+                                          ),
+                                        if (isMeterSoldFixedStockItemName(item.name) &&
+                                            item.specialRollMetersTotal > 0)
+                                          _statusChip(
+                                            context,
+                                            'Roll left ${formatDisplayNumber(item.specialRollMetersRemaining)}',
+                                            Colors.deepPurple,
                                           ),
                                         if (!isServiceItem) ...[
                                           _stockStatusChip(

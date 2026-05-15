@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/asset.dart';
 import '../services/app_settings_service.dart';
+import '../services/auth_service.dart';
 import '../services/local_db_service.dart';
 import '../utils/number_display.dart';
 import '../widgets/section_page_title.dart';
@@ -19,6 +20,7 @@ class AssetFormScreen extends StatefulWidget {
 
 class _AssetFormScreenState extends State<AssetFormScreen> {
   final _db = LocalDbService.instance;
+  final _auth = AuthService();
   final _settings = AppSettingsService.instance;
 
   late final TextEditingController _nameController;
@@ -101,20 +103,26 @@ class _AssetFormScreenState extends State<AssetFormScreen> {
 
     setState(() => _saving = true);
     try {
-      await _db.upsertAsset(
-        Asset(
-          id: widget.existing?.id,
-          storeId: widget.existing?.storeId,
-          name: name,
-          purchaseCost: purchaseCost,
-          currentValue: effectiveCurrent,
-          purchaseDate: _purchaseDate,
-          notes: _notesController.text.trim().isEmpty
-              ? null
-              : _notesController.text.trim(),
-          createdAt: widget.existing?.createdAt,
-        ),
+      final asset = Asset(
+        id: widget.existing?.id,
+        storeId: widget.existing?.storeId,
+        name: name,
+        purchaseCost: purchaseCost,
+        currentValue: effectiveCurrent,
+        purchaseDate: _purchaseDate,
+        notes: _notesController.text.trim().isEmpty
+            ? null
+            : _notesController.text.trim(),
+        createdAt: widget.existing?.createdAt,
       );
+      if (await _auth.isRemoteUser()) {
+        final remote = await _auth.saveRemoteAsset(asset.toMap());
+        if (remote['success'] != true) {
+          throw Exception((remote['message'] ?? 'Failed to sync asset').toString());
+        }
+      } else {
+        await _db.upsertAsset(asset);
+      }
       if (!mounted) return;
       Navigator.of(context).pop(true);
     } catch (e) {

@@ -1,9 +1,19 @@
-/// Stock at hand for these products is always [kMeterFixedDisplayStockQty].
-/// Sales do not reduce it; receives do not increase it
-/// (receipt rows still store quantities for costing/history).
+/// Special roll items (Ekiveera, carpet, ebinyobwa, plus user-defined names):
+/// stock is 0 (out) or 1 (one roll on hand). Sales do not deduct stock like normal
+/// items; availability is confirmed at checkout. Metres on the roll are tracked
+/// separately from stock at hand.
 library;
 
-const double kMeterFixedDisplayStockQty = 1;
+import '../services/special_items_service.dart';
+
+/// Stock at hand when a roll is available to sell.
+const double kSpecialItemAvailableStock = 1;
+
+/// Stock at hand when out of stock / roll finished.
+const double kSpecialItemUnavailableStock = 0;
+
+@Deprecated('Use kSpecialItemAvailableStock')
+const double kMeterFixedDisplayStockQty = kSpecialItemAvailableStock;
 
 /// Ekiveera white / black polyethylene (name pattern used elsewhere).
 bool isEkiveeraPolyethyleneRollItemName(String rawName) {
@@ -15,11 +25,24 @@ bool isEkiveeraPolyethyleneRollItemName(String rawName) {
   return white || black;
 }
 
-/// Ekiveera rolls, carpet, or **Ebinyobwa** (any spelling variant in name, e.g. `Ebinyobwa 1000/=`).
-bool isMeterSoldFixedStockItemName(String rawName) {
+bool _builtInSpecialItemName(String rawName) {
   if (isEkiveeraPolyethyleneRollItemName(rawName)) return true;
   final lower = rawName.trim().toLowerCase();
   if (lower.contains('carpet')) return true;
   if (lower.contains('ebinyobwa')) return true;
   return false;
+}
+
+/// Built-in patterns plus names added on the special-items settings screen.
+bool isMeterSoldFixedStockItemName(String rawName) {
+  if (_builtInSpecialItemName(rawName)) return true;
+  return SpecialItemsService.instance.matchesExtraName(rawName);
+}
+
+double specialRollMetersRemaining({
+  required double total,
+  required double sold,
+}) {
+  final left = total - sold;
+  return left < 0 ? 0 : left;
 }

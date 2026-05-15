@@ -16,6 +16,7 @@ import '../services/mother_data_cache.dart';
 import '../services/remote_sync_service.dart';
 import '../utils/barcode_utils.dart';
 import '../utils/meter_fixed_stock_items.dart';
+import '../utils/special_item_sale_dialog.dart';
 import '../utils/number_display.dart';
 import '../utils/text_format.dart';
 import '../widgets/section_page_title.dart';
@@ -47,6 +48,29 @@ class _CartEntry {
     required this.quantity,
     this.productDiscount = 0,
   });
+}
+
+class _SaleReceiptLine {
+  final String itemName;
+  final String unit;
+  final double quantity;
+  final double unitPrice;
+  final double productDiscount;
+
+  const _SaleReceiptLine({
+    required this.itemName,
+    required this.unit,
+    required this.quantity,
+    required this.unitPrice,
+    required this.productDiscount,
+  });
+
+  double get subtotal => quantity * unitPrice;
+  double get discountApplied => productDiscount > subtotal ? subtotal : productDiscount;
+  double get netTotal {
+    final net = subtotal - discountApplied;
+    return net < 0 ? 0 : net;
+  }
 }
 
 enum _PaymentMode { all, partial, zeroPaid }
@@ -133,9 +157,12 @@ class _SalesScreenState extends State<SalesScreen> {
   bool _isMeterFixedStockItem(Item item) =>
       isMeterSoldFixedStockItemName(item.name);
 
-  /// Service lines or fixed-stock items (Ekiveera, carpet, ebinyobwa): no cap from [Item.stockQty].
-  bool _lineIgnoresStockOnHand(Item item) =>
-      _isServiceSaleItem(item) || _isMeterFixedStockItem(item);
+  /// Service lines, or special items with stock 1: any sale qty without reducing stock.
+  bool _lineIgnoresStockOnHand(Item item) {
+    if (_isServiceSaleItem(item)) return true;
+    if (_isMeterFixedStockItem(item) && item.stockQty > 0) return true;
+    return false;
+  }
 
   String _saleCategoryLabel(Item item) {
     final raw = (item.category ?? '').trim();
@@ -148,7 +175,60 @@ class _SalesScreenState extends State<SalesScreen> {
     return toTitleCaseWords(raw);
   }
 
-  Future<void> _loadItems() async {
+  Item? _itemById(int? id) {
+    if (id == null) return null;
+    for (final item in _items) {
+      if (item.id == id) return item;
+    }
+    return null;
+  }
+
+  /// Latest item row for [item] (by id) after [_items] has been refreshed.
+  Item? _freshItem(Item? item) => item == null ? null : (_itemById(item.id) ?? item);
+
+  void _rebindCartToFreshItems() {
+    if (_cart.isEmpty) return;
+    for (var i = 0; i < _cart.length; i++) {
+      final e = _cart[i];
+      final fresh = _freshItem(e.item) ?? e.item;
+      if (!identical(fresh, e.item)) {
+        _cart[i] = _CartEntry(
+          item: fresh,
+          quantity: e.quantity,
+          productDiscount: e.productDiscount,
+        );
+      }
+    }
+  }
+
+  /// Wi‑Fi: always pull from mother before pick-list / barcode / quantity.
+  Future<bool> _refreshItemsFromMother({bool showError = true}) async {
+    final isRemote = await _auth.isRemoteUser();
+    if (!isRemote) {
+      await _loadItems(clearSelection: false);
+      return true;
+    }
+    final (ok, message, items) =
+        await RemoteSyncService.instance.pullItemsFromMother();
+    if (!mounted) return false;
+    if (!ok) {
+      if (showError) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      }
+      return false;
+    }
+    final aliases = MotherDataCache.instance.getItemBarcodeAliasesMap();
+    setState(() {
+      _items = items;
+      _itemBarcodeAliases = aliases;
+      _selectedItem = _freshItem(_selectedItem);
+    });
+    return true;
+  }
+
+  Future<void> _loadItems({bool clearSelection = true}) async {
     final isRemote = await _auth.isRemoteUser();
     final items = isRemote
         ? await RemoteSyncService.instance.fetchItems()
@@ -163,7 +243,11 @@ class _SalesScreenState extends State<SalesScreen> {
     setState(() {
       _items = items;
       _itemBarcodeAliases = aliases;
-      _selectedItem = null;
+      if (clearSelection) {
+        _selectedItem = null;
+      } else {
+        _selectedItem = _freshItem(_selectedItem);
+      }
     });
   }
 
@@ -612,7 +696,31 @@ class _SalesScreenState extends State<SalesScreen> {
 
   Future<void> _addToCart({double? forcedQty, double? forcedProductDiscount}) async {
     if (_selectedItem == null) return;
-    final selectedItem = _selectedItem!;
+    if (await _auth.isRemoteUser()) {
+      await _refreshItemsFromMother(showError: false);
+    }
+    if (!mounted) return;
+    final selectedItem = _freshItem(_selectedItem);
+    if (selectedItem == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Item not found. Pull to refresh items.')),
+      );
+      return;
+    }
+    if (_selectedItem!.id != selectedItem.id ||
+        _selectedItem!.stockQty != selectedItem.stockQty) {
+      setState(() => _selectedItem = selectedItem);
+    }
+    if (_isMeterFixedStockItem(selectedItem) && selectedItem.stockQty <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${toTitleCaseWords(selectedItem.name)} is out of stock. Receive a roll first.',
+          ),
+        ),
+      );
+      return;
+    }
     final skipStockCap = _lineIgnoresStockOnHand(selectedItem);
 
     final qty =
@@ -668,6 +776,62 @@ class _SalesScreenState extends State<SalesScreen> {
     });
   }
 
+  Future<void> _applySpecialLineOutcomeNow({
+    required int itemId,
+    required bool stillAvailable,
+    required double metersSold,
+    required bool isRemote,
+  }) async {
+    if (isRemote) {
+      final (ok, message) =
+          await RemoteSyncService.instance.pushSpecialSaleOutcomeToMother(
+        itemId: itemId,
+        stillAvailable: stillAvailable,
+        metersSold: metersSold,
+      );
+      if (!ok && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(message)),
+        );
+      }
+    } else {
+      await _db.applySpecialItemSaleOutcome(
+        itemId: itemId,
+        stillAvailable: stillAvailable,
+        metersSold: metersSold,
+      );
+    }
+    if (mounted) {
+      await _refreshItemsFromMother(showError: false);
+      setState(_rebindCartToFreshItems);
+    }
+  }
+
+  Future<void> _confirmSpecialItemsAfterSale({
+    required List<_CartEntry> specialLines,
+    required bool isRemote,
+  }) async {
+    if (specialLines.isEmpty) return;
+
+    for (final entry in specialLines) {
+      final itemId = entry.item.id;
+      if (itemId == null) continue;
+      if (!mounted) return;
+      final stillAvailable = await showSpecialItemAvailabilityDialog(
+        context,
+        itemName: entry.item.name,
+      );
+      if (!mounted) return;
+
+      await _applySpecialLineOutcomeNow(
+        itemId: itemId,
+        stillAvailable: stillAvailable,
+        metersSold: entry.quantity,
+        isRemote: isRemote,
+      );
+    }
+  }
+
   Future<void> _saveSale() async {
     if (_cart.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -676,11 +840,30 @@ class _SalesScreenState extends State<SalesScreen> {
       return;
     }
 
+    if (await _auth.isRemoteUser()) {
+      if (!await _refreshItemsFromMother()) return;
+      if (!mounted) return;
+      setState(_rebindCartToFreshItems);
+    }
+
+    final specialLines =
+        _cart.where((e) => _isMeterFixedStockItem(e.item)).toList();
+
     // Validate stock before saving
     for (final entry in _cart) {
       if (entry.quantity <= 0) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Invalid quantity for ${toTitleCaseWords(entry.item.name)}')),
+        );
+        return;
+      }
+      if (_isMeterFixedStockItem(entry.item) && entry.item.stockQty <= 0) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${toTitleCaseWords(entry.item.name)} is out of stock. Receive stock first.',
+            ),
+          ),
         );
         return;
       }
@@ -829,6 +1012,7 @@ class _SalesScreenState extends State<SalesScreen> {
         .toList();
 
     final isRemote = await _auth.isRemoteUser();
+    late final int saleId;
     if (isRemote) {
       if (_paymentMethod == _SalePaymentMethod.account &&
           amountReceived > 0 &&
@@ -872,6 +1056,8 @@ class _SalesScreenState extends State<SalesScreen> {
         );
         return;
       }
+      final rawId = remote['saleId'];
+      saleId = rawId is int ? rawId : (int.tryParse('$rawId') ?? 0);
     } else {
       if (_paymentMethod == _SalePaymentMethod.account &&
           amountReceived > 0 &&
@@ -884,8 +1070,32 @@ class _SalesScreenState extends State<SalesScreen> {
           note: 'Sale payment',
         );
       }
-      await _db.createSale(sale, saleItems);
+      saleId = await _db.createSale(sale, saleItems);
     }
+
+    await _confirmSpecialItemsAfterSale(
+      specialLines: specialLines,
+      isRemote: isRemote,
+    );
+    if (!mounted) return;
+
+    if (isRemote) {
+      await RemoteSyncService.instance.fetchItems();
+    } else {
+      await _loadItems(clearSelection: false);
+    }
+
+    final receiptLines = _cart
+        .map(
+          (e) => _SaleReceiptLine(
+            itemName: toTitleCaseWords(e.item.name),
+            unit: (e.item.unitShort ?? e.item.unit ?? '').trim(),
+            quantity: e.quantity,
+            unitPrice: e.item.sellingPrice,
+            productDiscount: e.productDiscount,
+          ),
+        )
+        .toList();
 
     if (!mounted) return;
     setState(() {
@@ -898,7 +1108,44 @@ class _SalesScreenState extends State<SalesScreen> {
       _paymentMethod = _SalePaymentMethod.cash;
     });
 
-        Navigator.of(context).pushReplacement(
+    await _showSaleReceiptPopup(
+      saleId: saleId,
+      totalAmount: totalAmount,
+      overallDiscount: _effectiveDiscount,
+      amountReceived: amountReceived,
+      balance: balance,
+      lines: receiptLines,
+    );
+  }
+
+  Future<void> _showSaleReceiptPopup({
+    required int saleId,
+    required double totalAmount,
+    required double overallDiscount,
+    required double amountReceived,
+    required double balance,
+    required List<_SaleReceiptLine> lines,
+  }) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) => _SaleReceiptDialog(
+        saleId: saleId,
+        currencySymbol: _currencySymbol,
+        totalAmount: totalAmount,
+        overallDiscount: overallDiscount,
+        amountReceived: amountReceived,
+        balance: balance,
+        lines: lines,
+        onProceedToSalesHistory: _navigateToSalesHistoryAfterSale,
+      ),
+    );
+  }
+
+  void _navigateToSalesHistoryAfterSale() {
+    if (!mounted) return;
+    Navigator.of(context).push(
       MaterialPageRoute(builder: (_) => const SalesHistoryScreen()),
     );
   }
@@ -926,7 +1173,6 @@ class _SalesScreenState extends State<SalesScreen> {
       );
       return;
     }
-    if (_items.isEmpty) return;
     final code = await Navigator.of(context).push<String>(
       MaterialPageRoute(builder: (_) => const BarcodeScanScreen()),
     );
@@ -937,6 +1183,8 @@ class _SalesScreenState extends State<SalesScreen> {
   Future<void> _applyBarcodeToSale(String code) async {
     final trimmed = code.trim();
     if (trimmed.isEmpty) return;
+    if (!await _refreshItemsFromMother()) return;
+    if (!mounted) return;
     final matches = _itemsMatchingBarcode(trimmed);
     final usedPartialMatch = matches.isNotEmpty &&
         barcodeScanMatchKindForItem(
@@ -948,7 +1196,18 @@ class _SalesScreenState extends State<SalesScreen> {
             ) ==
             BarcodeScanMatchKind.fuzzy;
     if (matches.length == 1) {
-      final item = matches.first;
+      final item = _freshItem(matches.first) ?? matches.first;
+      if (_isMeterFixedStockItem(item) && item.stockQty <= 0) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${toTitleCaseWords(item.name)} is out of stock. Receive a roll on the mother device first.',
+            ),
+          ),
+        );
+        return;
+      }
       if (usedPartialMatch && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -996,21 +1255,33 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
   Future<void> _openItemPage({String? initialSearchQuery}) async {
-    if (_items.isEmpty) return;
+    if (!await _refreshItemsFromMother()) return;
+    if (!mounted || _items.isEmpty) return;
     final result = await Navigator.of(context).push<Item>(
       MaterialPageRoute<Item>(
         builder: (context) => SaleItemScreen(
           items: _items,
           barcodeAliasesByItemId: _itemBarcodeAliases,
-          selectedItem: _selectedItem,
+          selectedItem: _freshItem(_selectedItem),
           currencySymbol: _currencySymbol,
           initialSearchQuery: initialSearchQuery,
         ),
       ),
     );
     if (!mounted || result == null) return;
+    final picked = _freshItem(result) ?? result;
+    if (_isMeterFixedStockItem(picked) && picked.stockQty <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${toTitleCaseWords(picked.name)} is out of stock. Receive stock on the mother device first.',
+          ),
+        ),
+      );
+      return;
+    }
     setState(() {
-      _selectedItem = result;
+      _selectedItem = picked;
       if (_isAllReceived) {
         _amountReceivedController.text = _fmtCompactNumber(_liveTotal);
       }
@@ -1064,20 +1335,42 @@ class _SalesScreenState extends State<SalesScreen> {
 
   Future<void> _openQuantityPage() async {
     if (_selectedItem == null) return;
-    if (_isServiceSaleItem(_selectedItem!)) {
+    if (!await _refreshItemsFromMother()) return;
+    if (!mounted) return;
+    final item = _freshItem(_selectedItem);
+    if (item == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Item no longer on mother. Refresh and try again.')),
+      );
+      setState(() => _selectedItem = null);
+      return;
+    }
+    if (_isMeterFixedStockItem(item) && item.stockQty <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${toTitleCaseWords(item.name)} is out of stock. Receive stock on the mother device first.',
+          ),
+        ),
+      );
+      setState(() => _selectedItem = item);
+      return;
+    }
+    setState(() => _selectedItem = item);
+    if (_isServiceSaleItem(item)) {
       await _addToCart(forcedQty: 1);
       return;
     }
     final currentQty = _cart
-        .where((e) => e.item.id == _selectedItem!.id)
+        .where((e) => e.item.id == item.id)
         .fold<double>(0, (sum, e) => sum + e.quantity);
-    final maxAvailable = _isMeterFixedStockItem(_selectedItem!)
+    final maxAvailable = _lineIgnoresStockOnHand(item)
         ? 1e12
-        : (_selectedItem!.stockQty - currentQty);
+        : (item.stockQty - currentQty);
     final result = await Navigator.of(context).push<Map<String, String>>(
       MaterialPageRoute<Map<String, String>>(
         builder: (context) => SaleQuantityScreen(
-          item: _selectedItem!,
+          item: item,
           cartTotal: _cartTotal,
           maxAvailable: maxAvailable,
           initialQuantity: _qtyController.text,
@@ -1100,14 +1393,20 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
   Future<void> _editCartEntry(int index) async {
+    if (await _auth.isRemoteUser()) {
+      if (!await _refreshItemsFromMother()) return;
+      if (!mounted) return;
+      setState(_rebindCartToFreshItems);
+    }
     final entry = _cart[index];
-    if (_isServiceSaleItem(entry.item)) {
+    final item = _freshItem(entry.item) ?? entry.item;
+    if (_isServiceSaleItem(item)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Service quantity is fixed to 1 per add.')),
       );
       return;
     }
-    final grossLineTotal = entry.item.sellingPrice * entry.quantity;
+    final grossLineTotal = item.sellingPrice * entry.quantity;
     final lineTotal =
         grossLineTotal - (entry.productDiscount > grossLineTotal ? grossLineTotal : entry.productDiscount);
     final baseCartTotal = _cartTotal - lineTotal;
@@ -1115,10 +1414,11 @@ class _SalesScreenState extends State<SalesScreen> {
     final result = await Navigator.of(context).push<Map<String, String>>(
       MaterialPageRoute<Map<String, String>>(
         builder: (context) => SaleQuantityScreen(
-          item: entry.item,
+          item: item,
           cartTotal: baseCartTotal,
-          maxAvailable:
-              _isMeterFixedStockItem(entry.item) ? 1e12 : entry.item.stockQty,
+          maxAvailable: _lineIgnoresStockOnHand(item)
+              ? 1e12
+              : item.stockQty,
           initialQuantity: _fmtCompactNumber(entry.quantity),
           initialProductDiscount:
               entry.productDiscount > 0 ? _fmtCompactNumber(entry.productDiscount) : '',
@@ -1137,7 +1437,7 @@ class _SalesScreenState extends State<SalesScreen> {
       return;
     }
     final stockCap =
-        _isMeterFixedStockItem(entry.item) ? 1e12 : entry.item.stockQty;
+        _lineIgnoresStockOnHand(item) ? 1e12 : item.stockQty;
     if (newQty > stockCap) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1151,7 +1451,7 @@ class _SalesScreenState extends State<SalesScreen> {
 
     setState(() {
       _cart[index] = _CartEntry(
-        item: entry.item,
+        item: item,
         quantity: newQty,
         productDiscount: newProductDiscount,
       );
@@ -1763,6 +2063,244 @@ class _SalesScreenState extends State<SalesScreen> {
               ),
         ),
       ),
+    );
+  }
+}
+
+class _SaleReceiptDialog extends StatefulWidget {
+  const _SaleReceiptDialog({
+    required this.saleId,
+    required this.currencySymbol,
+    required this.totalAmount,
+    required this.overallDiscount,
+    required this.amountReceived,
+    required this.balance,
+    required this.lines,
+    this.onProceedToSalesHistory,
+  });
+
+  final int saleId;
+  final String currencySymbol;
+  final double totalAmount;
+  final double overallDiscount;
+  final double amountReceived;
+  final double balance;
+  final List<_SaleReceiptLine> lines;
+  final VoidCallback? onProceedToSalesHistory;
+
+  @override
+  State<_SaleReceiptDialog> createState() => _SaleReceiptDialogState();
+}
+
+class _SaleReceiptDialogState extends State<_SaleReceiptDialog> {
+  Timer? _autoCloseTicker;
+  late int _secondsLeft;
+
+  @override
+  void initState() {
+    super.initState();
+    _secondsLeft = 20;
+    _autoCloseTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      if (_secondsLeft <= 1) {
+        _autoCloseTicker?.cancel();
+        Navigator.of(context).pop();
+        return;
+      }
+      setState(() => _secondsLeft--);
+    });
+  }
+
+  @override
+  void dispose() {
+    _autoCloseTicker?.cancel();
+    super.dispose();
+  }
+
+  void _goToSalesHistory() {
+    _autoCloseTicker?.cancel();
+    if (!mounted) return;
+    Navigator.of(context).pop();
+    widget.onProceedToSalesHistory?.call();
+  }
+
+  String _fmtMoney(double value) => formatMoney(value);
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final linkColor = theme.colorScheme.primary;
+    final grandSubtotal = widget.lines.fold<double>(
+      0,
+      (sum, line) => sum + line.netTotal,
+    );
+    return AlertDialog(
+      title: const Text('Sale receipt'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Receipt: #${widget.saleId}'),
+              const SizedBox(height: 4),
+              Text('Items: ${widget.lines.length}'),
+              const SizedBox(height: 10),
+              Table(
+                defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+                columnWidths: const {
+                  0: FlexColumnWidth(2.2),
+                  1: FlexColumnWidth(0.9),
+                  2: FlexColumnWidth(1.1),
+                  3: FlexColumnWidth(1),
+                },
+                children: [
+                  const TableRow(
+                    children: [
+                      Padding(
+                        padding: EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          'Item',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      Padding(
+                        padding: EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          'Qty',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      Padding(
+                        padding: EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          'Unit',
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      Padding(
+                        padding: EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          'Total',
+                          textAlign: TextAlign.right,
+                          style: TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                    ],
+                  ),
+                  ...widget.lines.map(
+                    (line) => TableRow(
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6, right: 6),
+                          child: Text(
+                            line.unit.isEmpty
+                                ? line.itemName
+                                : '${line.itemName} (${line.unit})',
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Text(formatDisplayNumber(line.quantity)),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Text(
+                            '${widget.currencySymbol}${_fmtMoney(line.unitPrice)}',
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Text(
+                            '${widget.currencySymbol}${_fmtMoney(line.netTotal)}',
+                            textAlign: TextAlign.right,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const Divider(height: 18),
+              _receiptSummaryRow(
+                'Grand subtotal',
+                '${widget.currencySymbol}${_fmtMoney(grandSubtotal)}',
+              ),
+              const SizedBox(height: 4),
+              _receiptSummaryRow(
+                'Overall discount',
+                '${widget.currencySymbol}${_fmtMoney(widget.overallDiscount)}',
+              ),
+              const SizedBox(height: 6),
+              _receiptSummaryRow(
+                'Final total',
+                '${widget.currencySymbol}${_fmtMoney(widget.totalAmount)}',
+                bold: true,
+              ),
+              const SizedBox(height: 4),
+              _receiptSummaryRow(
+                'Paid',
+                '${widget.currencySymbol}${_fmtMoney(widget.amountReceived)}',
+              ),
+              const SizedBox(height: 4),
+              _receiptSummaryRow(
+                'Balance',
+                '${widget.currencySymbol}${_fmtMoney(widget.balance)}',
+                bold: true,
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'This receipt closes automatically in $_secondsLeft ${_secondsLeft == 1 ? 'second' : 'seconds'}.',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF6B7280)),
+              ),
+              const SizedBox(height: 10),
+              Align(
+                alignment: Alignment.center,
+                child: GestureDetector(
+                  onTap: _goToSalesHistory,
+                  child: Text(
+                    'Proceed to the Sales history page',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: linkColor,
+                      fontWeight: FontWeight.w600,
+                      decoration: TextDecoration.underline,
+                      decorationColor: linkColor,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            _autoCloseTicker?.cancel();
+            Navigator.of(context).pop();
+          },
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+
+  Widget _receiptSummaryRow(String label, String value, {bool bold = false}) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
+          style: TextStyle(fontWeight: bold ? FontWeight.w700 : FontWeight.w500),
+        ),
+        Text(
+          value,
+          style: TextStyle(fontWeight: bold ? FontWeight.w700 : FontWeight.w500),
+        ),
+      ],
     );
   }
 }

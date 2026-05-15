@@ -4,9 +4,11 @@
 import 'package:flutter/material.dart';
 import 'navigation/app_router.dart';
 import 'services/low_stock_notification_service.dart';
+import 'services/special_items_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await SpecialItemsService.instance.ensureLoaded();
   await LowStockNotificationService.instance.initialize();
   await LowStockNotificationService.instance.requestPermissionIfNeeded();
   await LowStockNotificationService.instance.scheduleTwiceDailyLowStockAlerts();

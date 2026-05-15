@@ -94,6 +94,12 @@ class MotherDataCache {
       'stock_qty': _toDouble(row['stock_qty'] ?? row['stockQty']),
       'reorder_level': _toDouble(row['reorder_level'] ?? row['reorderLevel']),
       'restock_to': _toDouble(row['restock_to'] ?? row['restockTo']),
+      'special_roll_meters_total': _toDouble(
+        row['special_roll_meters_total'] ?? row['specialRollMetersTotal'],
+      ),
+      'special_roll_meters_sold': _toDouble(
+        row['special_roll_meters_sold'] ?? row['specialRollMetersSold'],
+      ),
       'created_at': _toIsoNowIfEmpty(row['created_at'] ?? row['createdAt']),
     };
   }
