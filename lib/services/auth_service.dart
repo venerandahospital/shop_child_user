@@ -8,7 +8,10 @@ import 'package:multicast_dns/multicast_dns.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/debt.dart';
+import '../models/expense.dart';
 import '../models/loan.dart';
+import '../models/service_transaction.dart';
 import 'mother_data_cache.dart';
 
 class AuthService {
@@ -260,20 +263,40 @@ class AuthService {
   }
 
   Future<(bool ok, String message)> testConnection() async {
-    try {
-      final baseUrl = await getBaseUrl();
-      final res = await http
-          .get(_buildUri(baseUrl, '/health'))
-          .timeout(const Duration(seconds: 6));
-      if (res.statusCode == 200) {
-        return (true, 'Connected to mother API.');
-      }
-      return (false, 'Mother API responded with ${res.statusCode}.');
-    } on SocketException {
-      return (false, 'Mother API cannot be reached from this phone.');
-    } catch (_) {
-      return (false, 'Failed to connect to mother API.');
+    final connected = await connectViaSavedUrls();
+    if (connected != null) {
+      return (true, 'Connected to mother API at $connected.');
     }
+    final saved = await _savedMotherBaseUrlCandidates();
+    if (saved.isEmpty) {
+      return (
+        false,
+        'No mother base URL saved. Add one from Mother Settings.',
+      );
+    }
+    return (
+      false,
+      'None of your saved mother URLs responded. Check Wi‑Fi and that the mother app is running.',
+    );
+  }
+
+  /// Walks every saved mother URL (current, then history) and uses the first that
+  /// answers `/health`. Updates the active base URL when one works.
+  Future<String?> connectViaSavedUrls({
+    Duration healthTimeout = const Duration(seconds: 4),
+  }) async {
+    final candidates = await _savedMotherBaseUrlCandidates();
+    for (final baseUrl in candidates) {
+      final result = await _testHealthOnBaseUrl(
+        baseUrl,
+        timeout: healthTimeout,
+      );
+      if (result.$1) {
+        await setBaseUrl(baseUrl);
+        return baseUrl;
+      }
+    }
+    return null;
   }
 
   Future<(bool ok, String message)> testBaseUrlHealth(String baseUrl) async {
@@ -284,58 +307,92 @@ class AuthService {
     return _testHealthOnBaseUrl(normalized);
   }
 
+  /// Tries saved/history URLs first, then network discovery (mDNS/UDP/heuristics).
   Future<(bool ok, String message, String? workingBaseUrl)>
-  testConnectionWithFallback() async {
+  testConnectionWithFallback({bool runDiscoveryIfSavedFails = true}) async {
+    final savedCandidates = await _savedMotherBaseUrlCandidates();
+    final fromSaved = await connectViaSavedUrls();
+    if (fromSaved != null) {
+      return (true, 'Connected to mother API at $fromSaved', fromSaved);
+    }
+
+    if (!runDiscoveryIfSavedFails) {
+      return (
+        false,
+        savedCandidates.isEmpty
+            ? 'No mother base URL found. Please provide a new URL from Mother Settings.'
+            : 'None of your saved mother URLs responded. Check that the mother app is open on the same network.',
+        null,
+      );
+    }
+
+    final fromDiscovery = await _discoverAndConnectMother(
+      skipUrls: savedCandidates,
+    );
+    if (fromDiscovery != null) {
+      final viaDiscovery = fromDiscovery.$2;
+      return (
+        true,
+        viaDiscovery
+            ? 'Connected to mother API via network discovery at ${fromDiscovery.$1}'
+            : 'Connected to mother API at ${fromDiscovery.$1}',
+        fromDiscovery.$1,
+      );
+    }
+
+    return (
+      false,
+      savedCandidates.isEmpty
+          ? 'No mother base URL found. Please provide a new URL from Mother Settings.'
+          : 'Mother discovery failed and no saved mother base URL works. Please provide a new mother base URL from Mother Settings.',
+      null,
+    );
+  }
+
+  /// mDNS/UDP/heuristics after saved URLs fail. Returns (url, viaDiscovery).
+  Future<(String url, bool viaDiscovery)?> _discoverAndConnectMother({
+    List<String> skipUrls = const [],
+  }) async {
+    final skip = skipUrls.toSet();
     final discovered = await _discoverMotherBaseUrlsWithMulticastLock();
     final heuristic = _dedupePreserveOrder(<String>[
       ...discovered,
       ...await _heuristicMotherBaseUrls(),
     ]);
-    if (heuristic.isNotEmpty) {
-      for (final baseUrl in heuristic) {
-        final result = await _testHealthOnBaseUrl(baseUrl);
-        if (result.$1) {
-          await setBaseUrl(baseUrl);
-          final viaDiscovery = discovered.contains(baseUrl);
-          return (
-            true,
-            viaDiscovery
-                ? 'Connected to mother API via network discovery at $baseUrl'
-                : 'Connected to mother API at $baseUrl',
-            baseUrl,
-          );
-        }
-      }
-    }
-
-    final currentBase = await getBaseUrl();
-    final history = await getBaseUrlHistory();
-    final candidates = _dedupePreserveOrder(<String>[currentBase, ...history]
-        .map(_normalizeBaseUrl)
-        .where((value) => value.isNotEmpty)
-        .toList(growable: false));
-
-    if (candidates.isEmpty) {
-      return (
-        false,
-        'No mother base URL found. Please provide a new URL from Mother Settings.',
-        null,
-      );
-    }
-
-    for (final baseUrl in candidates) {
+    for (final baseUrl in heuristic) {
+      if (skip.contains(baseUrl)) continue;
       final result = await _testHealthOnBaseUrl(baseUrl);
       if (result.$1) {
         await setBaseUrl(baseUrl);
-        return (true, 'Connected to mother API at $baseUrl', baseUrl);
+        return (baseUrl, discovered.contains(baseUrl));
       }
     }
+    return null;
+  }
 
-    return (
-      false,
-      'Mother discovery failed and no saved mother base URL works. Please provide a new mother base URL from Mother Settings.',
-      null,
-    );
+  Future<List<String>> _savedMotherBaseUrlCandidates() async {
+    final currentBase = await getBaseUrl();
+    final history = await getBaseUrlHistory();
+    return _dedupePreserveOrder(<String>[currentBase, ...history]
+        .map(_normalizeBaseUrl)
+        .where((value) => value.isNotEmpty)
+        .toList(growable: false));
+  }
+
+  /// Resolves a working mother API base URL: all saved URLs first, then discovery.
+  Future<String?> resolveMotherApiBaseUrl({
+    Duration discoveryTimeout = const Duration(seconds: 4),
+  }) async {
+    assert(discoveryTimeout >= Duration.zero);
+    final healthTimeout = discoveryTimeout == Duration.zero
+        ? const Duration(seconds: 4)
+        : discoveryTimeout;
+    final fromSaved = await connectViaSavedUrls(healthTimeout: healthTimeout);
+    if (fromSaved != null) return fromSaved;
+    final (_, _, url) = await testConnectionWithFallback();
+    if (url != null && url.trim().isNotEmpty) return url;
+    final current = _normalizeBaseUrl(await getBaseUrl());
+    return current.isEmpty ? null : current;
   }
 
   Future<List<String>> _discoverMotherBaseUrls() async {
@@ -515,11 +572,14 @@ class AuthService {
     } catch (_) {}
   }
 
-  Future<(bool ok, String message)> _testHealthOnBaseUrl(String baseUrl) async {
+  Future<(bool ok, String message)> _testHealthOnBaseUrl(
+    String baseUrl, {
+    Duration timeout = const Duration(seconds: 6),
+  }) async {
     try {
       final res = await http
           .get(_buildUri(baseUrl, '/health'))
-          .timeout(const Duration(seconds: 6));
+          .timeout(timeout);
       if (res.statusCode == 200) {
         return (true, 'Connected to mother API.');
       }
@@ -764,23 +824,39 @@ class AuthService {
   Future<bool> _tryAutoReconnectMother() async {
     if (_reconnectInProgress != null) {
       await _reconnectInProgress;
-      final test = await testConnection();
-      return test.$1;
+      return (await connectViaSavedUrls()) != null;
     }
 
     final completer = Completer<void>();
     _reconnectInProgress = completer.future;
+    var connected = false;
     try {
-      // Keep trying until mother comes back online.
-      // This guarantees page refresh/API retries can recover automatically.
-      while (true) {
+      const maxAttempts = 10;
+      for (var attempt = 0; attempt < maxAttempts; attempt++) {
         try {
-          final result = await testConnectionWithFallback();
-          if (result.$1) break;
+          // Always walk every saved URL before anything else.
+          final fromSaved = await connectViaSavedUrls();
+          if (fromSaved != null) {
+            connected = true;
+            break;
+          }
+
+          // Mother IP may have changed — try discovery after saved URLs fail.
+          if (attempt >= 1) {
+            final fromDiscovery = await _discoverAndConnectMother(
+              skipUrls: await _savedMotherBaseUrlCandidates(),
+            );
+            if (fromDiscovery != null) {
+              connected = true;
+              break;
+            }
+          }
         } catch (_) {
           // Ignore and keep retrying.
         }
-        await Future.delayed(const Duration(seconds: 2));
+        if (attempt < maxAttempts - 1) {
+          await Future.delayed(const Duration(seconds: 2));
+        }
       }
     } catch (_) {
       // best effort reconnect only
@@ -789,8 +865,33 @@ class AuthService {
       _reconnectInProgress = null;
     }
 
-    final test = await testConnection();
-    return test.$1;
+    if (connected) return true;
+    return (await connectViaSavedUrls()) != null;
+  }
+
+  bool _isConnectionError(Object error) {
+    return error is SocketException ||
+        error is TimeoutException ||
+        error is http.ClientException ||
+        error is HandshakeException ||
+        error is OSError;
+  }
+
+  Future<bool> _reconnectAfterConnectionLoss() => _tryAutoReconnectMother();
+
+  static const _connectionLostMessage =
+      'Mother API cannot be reached. Tried all saved URLs — check Wi‑Fi and the mother app.';
+
+  Future<Map<String, dynamic>?> _retryRemoteAfterConnectionLoss({
+    required Object error,
+    required bool allowReconnectRetry,
+    required Future<Map<String, dynamic>> Function() retry,
+  }) async {
+    if (!allowReconnectRetry || !_isConnectionError(error)) return null;
+    if (await _reconnectAfterConnectionLoss()) {
+      return retry();
+    }
+    return {'success': false, 'message': _connectionLostMessage};
   }
 
   bool _shouldReconnectForStatus(int statusCode) {
@@ -859,15 +960,16 @@ class AuthService {
             .toString(),
         ...data,
       };
-    } on SocketException {
-      if (await _tryAutoReconnectMother()) {
-        return getRemoteAuthorized(path: path, allowReconnectRetry: false);
-      }
-      return {
-        'success': false,
-        'message': 'Mother API cannot be reached. Check connection.',
-      };
-    } catch (_) {
+    } catch (e) {
+      final retried = await _retryRemoteAfterConnectionLoss(
+        error: e,
+        allowReconnectRetry: allowReconnectRetry,
+        retry: () => getRemoteAuthorized(
+          path: path,
+          allowReconnectRetry: false,
+        ),
+      );
+      if (retried != null) return retried;
       return {'success': false, 'message': 'Remote request failed.'};
     }
   }
@@ -912,19 +1014,17 @@ class AuthService {
             .toString(),
         ...data,
       };
-    } on SocketException {
-      if (await _tryAutoReconnectMother()) {
-        return postRemoteAuthorized(
+    } catch (e) {
+      final retried = await _retryRemoteAfterConnectionLoss(
+        error: e,
+        allowReconnectRetry: allowReconnectRetry,
+        retry: () => postRemoteAuthorized(
           path: path,
           body: body,
           allowReconnectRetry: false,
-        );
-      }
-      return {
-        'success': false,
-        'message': 'Mother API cannot be reached. Check connection.',
-      };
-    } catch (_) {
+        ),
+      );
+      if (retried != null) return retried;
       return {'success': false, 'message': 'Remote request failed.'};
     }
   }
@@ -969,19 +1069,17 @@ class AuthService {
             .toString(),
         ...data,
       };
-    } on SocketException {
-      if (await _tryAutoReconnectMother()) {
-        return putRemoteAuthorized(
+    } catch (e) {
+      final retried = await _retryRemoteAfterConnectionLoss(
+        error: e,
+        allowReconnectRetry: allowReconnectRetry,
+        retry: () => putRemoteAuthorized(
           path: path,
           body: body,
           allowReconnectRetry: false,
-        );
-      }
-      return {
-        'success': false,
-        'message': 'Mother API cannot be reached. Check connection.',
-      };
-    } catch (_) {
+        ),
+      );
+      if (retried != null) return retried;
       return {'success': false, 'message': 'Remote request failed.'};
     }
   }
@@ -1017,15 +1115,16 @@ class AuthService {
             .toString(),
         ...data,
       };
-    } on SocketException {
-      if (await _tryAutoReconnectMother()) {
-        return deleteRemoteAuthorized(path: path, allowReconnectRetry: false);
-      }
-      return {
-        'success': false,
-        'message': 'Mother API cannot be reached. Check connection.',
-      };
-    } catch (_) {
+    } catch (e) {
+      final retried = await _retryRemoteAfterConnectionLoss(
+        error: e,
+        allowReconnectRetry: allowReconnectRetry,
+        retry: () => deleteRemoteAuthorized(
+          path: path,
+          allowReconnectRetry: false,
+        ),
+      );
+      if (retried != null) return retried;
       return {'success': false, 'message': 'Remote request failed.'};
     }
   }
@@ -1118,8 +1217,84 @@ class AuthService {
     );
   }
 
-  Future<Map<String, dynamic>> fetchRemoteServices() {
-    return getRemoteAuthorized(path: '/services');
+  List<Map<String, Object?>> _mapListFromRemoteData(dynamic data) {
+    if (data is! List) return const [];
+    final out = <Map<String, Object?>>[];
+    for (final row in data) {
+      if (row is Map<String, Object?>) {
+        out.add(row);
+      } else if (row is Map) {
+        out.add(Map<String, Object?>.from(row));
+      }
+    }
+    return out;
+  }
+
+  Future<List<Map<String, Object?>>> fetchRemoteSalesHistory({
+    DateTime? start,
+    DateTime? end,
+  }) async {
+    final queryParts = <String>[];
+    if (start != null) {
+      queryParts.add('start=${Uri.encodeQueryComponent(start.toIso8601String())}');
+    }
+    if (end != null) {
+      queryParts.add('end=${Uri.encodeQueryComponent(end.toIso8601String())}');
+    }
+    final suffix = queryParts.isEmpty ? '' : '?${queryParts.join('&')}';
+    final res = await getRemoteAuthorized(path: '/sales/history$suffix');
+    if (res['success'] != true) return const [];
+    return _mapListFromRemoteData(res['data']);
+  }
+
+  Future<List<Debt>> fetchRemoteDebts({bool? isPaid}) async {
+    final suffix =
+        isPaid == null ? '' : '?isPaid=${isPaid ? 'true' : 'false'}';
+    final res = await getRemoteAuthorized(path: '/debts$suffix');
+    if (res['success'] != true) return const [];
+    final rows = res['data'];
+    if (rows is! List) return const [];
+    return rows
+        .map(
+          (e) => e is Map<String, dynamic>
+              ? Debt.fromMap(e)
+              : Debt.fromMap(Map<String, dynamic>.from(e as Map)),
+        )
+        .toList();
+  }
+
+  Future<List<Expense>> fetchRemoteExpenses() async {
+    final res = await getRemoteAuthorized(path: '/expenses');
+    if (res['success'] != true) return const [];
+    final rows = res['data'];
+    if (rows is! List) return const [];
+    return rows
+        .map(
+          (e) => e is Map<String, dynamic>
+              ? Expense.fromMap(e)
+              : Expense.fromMap(Map<String, dynamic>.from(e as Map)),
+        )
+        .toList();
+  }
+
+  Future<List<ServiceTransaction>> fetchRemoteServices() async {
+    final res = await getRemoteAuthorized(path: '/services');
+    if (res['success'] != true) return const [];
+    final rows = res['data'];
+    if (rows is! List) return const [];
+    return rows
+        .map(
+          (e) => e is Map<String, dynamic>
+              ? ServiceTransaction.fromMap(e)
+              : ServiceTransaction.fromMap(Map<String, dynamic>.from(e as Map)),
+        )
+        .toList();
+  }
+
+  Future<List<Map<String, Object?>>> fetchRemoteStockReceipts() async {
+    final res = await getRemoteAuthorized(path: '/stock/receipts');
+    if (res['success'] != true) return const [];
+    return _mapListFromRemoteData(res['data']);
   }
 
   Future<Map<String, dynamic>> fetchRemoteServiceById(int serviceId) {
@@ -1238,6 +1413,50 @@ class AuthService {
     Map<String, dynamic> payload, {
     bool usePut = false,
   }) {
+    final destOnly = payload['destinationOnly'] == true;
+    if (destOnly) {
+      final fromItemId = _asInt(payload['fromItemId'] ?? payload['from_item_id']);
+      final toItemId = _asInt(payload['toItemId'] ?? payload['to_item_id']);
+      final toQuantity =
+          _asDouble(payload['toQuantity'] ?? payload['to_quantity']);
+      if (fromItemId == null ||
+          toItemId == null ||
+          toQuantity == null ||
+          toQuantity <= 0) {
+        return Future.value(
+          {
+            'success': false,
+            'message':
+                'Invalid destination-only transfer: fromItemId, toItemId, and toQuantity are required.',
+          },
+        );
+      }
+      final normalized = <String, dynamic>{
+        'destinationOnly': true,
+        'fromItemId': fromItemId,
+        'toItemId': toItemId,
+        'toQuantity': toQuantity,
+      };
+      final toCostPrice =
+          _asDouble(payload['toCostPrice'] ?? payload['to_cost_price']);
+      if (toCostPrice != null) {
+        normalized['toCostPrice'] = toCostPrice;
+      }
+      final toSellingPrice =
+          _asDouble(payload['toSellingPrice'] ?? payload['to_selling_price']);
+      if (toSellingPrice != null) {
+        normalized['toSellingPrice'] = toSellingPrice;
+      }
+      final storeId = _asInt(payload['storeId'] ?? payload['store_id']);
+      if (storeId != null) {
+        normalized['storeId'] = storeId;
+      }
+      if (usePut) {
+        return putRemoteAuthorized(path: '/stock/transfers', body: normalized);
+      }
+      return postRemoteAuthorized(path: '/stock/transfers', body: normalized);
+    }
+
     final normalized = <String, dynamic>{};
     final fromItemId = _asInt(payload['fromItemId'] ?? payload['from_item_id']);
     final toItemId = _asInt(payload['toItemId'] ?? payload['to_item_id']);

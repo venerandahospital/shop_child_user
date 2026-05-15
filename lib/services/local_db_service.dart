@@ -20,6 +20,8 @@ import '../models/expense_category.dart';
 import '../models/asset.dart';
 import '../models/loan.dart';
 import '../models/cart_draft.dart';
+import '../models/service_transaction.dart';
+import '../utils/meter_fixed_stock_items.dart';
 import 'mother_data_cache.dart';
 
 class LocalDbService {
@@ -30,7 +32,7 @@ class LocalDbService {
   static const _mainDbName = 'shop_manager_retail_supermarket.db';
   static const _authDbName = 'shop_manager_auth.db';
   static const _legacyDbName = 'shop_manager.db';
-  static const _dbVersion = 28;
+  static const _dbVersion = 29;
   final ValueNotifier<int> transactionVersion = ValueNotifier<int>(0);
   static const _metaBusinessName = 'business_name';
   static const _metaBusinessCode = 'business_code';
@@ -317,6 +319,17 @@ class LocalDbService {
             category TEXT,
             paid_by TEXT,
             received_by TEXT,
+            notes TEXT,
+            amount REAL NOT NULL,
+            created_at TEXT NOT NULL
+          )
+        ''');
+
+        await db.execute('''
+          CREATE TABLE service_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER,
+            title TEXT NOT NULL,
             notes TEXT,
             amount REAL NOT NULL,
             created_at TEXT NOT NULL
@@ -702,6 +715,18 @@ class LocalDbService {
             )
           ''');
         }
+        if (oldVersion < 29) {
+          await db.execute('''
+            CREATE TABLE IF NOT EXISTS service_transactions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              store_id INTEGER,
+              title TEXT NOT NULL,
+              notes TEXT,
+              amount REAL NOT NULL,
+              created_at TEXT NOT NULL
+            )
+          ''');
+        }
       },
       onOpen: (db) async {
         // Safety net: if DB version is already 4 but old migration missed this table.
@@ -882,6 +907,16 @@ class LocalDbService {
           CREATE TABLE IF NOT EXISTS app_meta (
             key TEXT PRIMARY KEY,
             value TEXT
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE IF NOT EXISTS service_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER,
+            title TEXT NOT NULL,
+            notes TEXT,
+            amount REAL NOT NULL,
+            created_at TEXT NOT NULL
           )
         ''');
         await _migrateAuthDatabaseIntoMainDb(db);
@@ -1275,19 +1310,48 @@ class LocalDbService {
 
   Future<int> upsertItem(Item item) async {
     final db = await database;
-    int result;
-    if (item.id == null) {
-      result = await db.insert('items', item.toMap());
-    } else {
-      result = await db.update(
-        'items',
-        item.toMap(),
-        where: 'id = ?',
-        whereArgs: [item.id],
-      );
+    final itemToSave = isMeterSoldFixedStockItemName(item.name)
+        ? item.copyWith(stockQty: kMeterFixedDisplayStockQty)
+        : item;
+    if (itemToSave.id == null) {
+      final id = await db.transaction<int>((txn) async {
+        var toInsert = itemToSave;
+        final skuEmpty = (toInsert.sku ?? '').trim().isEmpty;
+        final bcEmpty = (toInsert.barcode ?? '').trim().isEmpty;
+        if (skuEmpty && bcEmpty) {
+          final gen = await _generateNextInternalSkuForExecutor(txn);
+          toInsert = toInsert.copyWith(sku: gen, barcode: gen);
+        } else if (!skuEmpty && bcEmpty) {
+          toInsert = toInsert.copyWith(barcode: toInsert.sku);
+        } else if (skuEmpty && !bcEmpty) {
+          toInsert = toInsert.copyWith(sku: toInsert.barcode);
+        }
+        return txn.insert('items', toInsert.toMap());
+      });
+      _notifyDataChanged();
+      return id;
     }
+    final result = await db.update(
+      'items',
+      itemToSave.toMap(),
+      where: 'id = ?',
+      whereArgs: [itemToSave.id],
+    );
     _notifyDataChanged();
     return result;
+  }
+
+  Future<Item?> getItemById(int id) async {
+    if (id <= 0) return null;
+    final db = await database;
+    final rows = await db.query(
+      'items',
+      where: 'id = ?',
+      whereArgs: [id],
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    return Item.fromMap(Map<String, dynamic>.from(rows.first));
   }
 
   String _normalizeCode(String? raw) => (raw ?? '').trim().toLowerCase();
@@ -1306,7 +1370,11 @@ class LocalDbService {
 
   Future<String> generateNextInternalSku() async {
     final db = await database;
-    final rows = await db.query('items', columns: ['sku', 'barcode']);
+    return _generateNextInternalSkuForExecutor(db);
+  }
+
+  Future<String> _generateNextInternalSkuForExecutor(DatabaseExecutor exec) async {
+    final rows = await exec.query('items', columns: ['sku', 'barcode']);
     final taken = <String>{};
     final pattern = RegExp(r'^ITM(\d{6})$');
     var next = 1;
@@ -1613,6 +1681,14 @@ class LocalDbService {
     );
     if (rows.isEmpty) return 0;
     final item = Item.fromMap(rows.first);
+    if (isMeterSoldFixedStockItemName(item.name)) {
+      return await db.update(
+        'items',
+        item.copyWith(stockQty: kMeterFixedDisplayStockQty).toMap(),
+        where: 'id = ?',
+        whereArgs: [itemId],
+      );
+    }
     final newQty = item.stockQty + delta;
     if (newQty < 0) return 0;
     final result = await db.update(
@@ -1667,7 +1743,10 @@ class LocalDbService {
       whereArgs: storeId != null ? [storeId] : null,
       orderBy: 'name COLLATE NOCASE ASC',
     );
-    return maps.map(Item.fromMap).toList();
+    return maps
+        .map(Item.fromMap)
+        .where((e) => !isMeterSoldFixedStockItemName(e.name))
+        .toList();
   }
 
   // ===== PRODUCT CATEGORIES =====
@@ -1939,8 +2018,10 @@ class LocalDbService {
       if (maps.isEmpty) return 0;
 
       final item = Item.fromMap(maps.first);
+      final fixedStock = isMeterSoldFixedStockItemName(item.name);
       final oldQty = item.stockQty;
-      final newQty = oldQty + quantity;
+      final newQty =
+          fixedStock ? kMeterFixedDisplayStockQty : oldQty + quantity;
 
       final receipt = StockReceipt(
         storeId: storeId ?? item.storeId,
@@ -2012,6 +2093,12 @@ class LocalDbService {
 
       final fromItem = Item.fromMap(fromRows.first);
       final toItem = Item.fromMap(toRows.first);
+      if (isMeterSoldFixedStockItemName(fromItem.name) ||
+          isMeterSoldFixedStockItemName(toItem.name)) {
+        throw ArgumentError(
+          'Transfers are not supported for fixed-stock items (Ekiveera, carpet, ebinyobwa).',
+        );
+      }
       final oldFromQty = fromItem.stockQty;
       final oldToQty = toItem.stockQty;
       if (oldFromQty < fromQuantity) {
@@ -2152,10 +2239,16 @@ class LocalDbService {
         );
         if (itemRows.isNotEmpty) {
           final existing = Item.fromMap(itemRows.first);
-          if (_isServiceSaleCategory(existing.category)) {
+          if (_isServiceSaleCategory(existing.category) ||
+              isMeterSoldFixedStockItemName(existing.name)) {
             continue;
           }
           final newQty = existing.stockQty - item.quantity;
+          if (newQty < -0.0001) {
+            throw StateError(
+              'Not enough stock for this item. Available: ${existing.stockQty}.',
+            );
+          }
           await txn.update(
             'items',
             existing.copyWith(stockQty: newQty).toMap(),
@@ -2677,15 +2770,8 @@ class LocalDbService {
   }
 
   Future<int> getReorderCount({int? storeId}) async {
-    final db = await database;
-    final result = await db.rawQuery('''
-      SELECT COUNT(*) as count
-      FROM items
-      WHERE (stock_qty <= reorder_level OR stock_qty <= 0)
-      ${storeId != null ? 'AND store_id = ?' : ''}
-      ''', storeId != null ? [storeId] : []);
-    final value = result.first['count'] as int?;
-    return value ?? 0;
+    final items = await getReorderItems(storeId: storeId);
+    return items.length;
   }
 
   // ===== LOANS =====
@@ -2865,6 +2951,56 @@ class LocalDbService {
     final db = await database;
     final result = await db.delete(
       'expenses',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+    if (result > 0) _notifyDataChanged();
+    return result;
+  }
+
+  // ===== SERVICE TRANSACTIONS (local mode) =====
+
+  Future<int> upsertServiceTransaction(ServiceTransaction service) async {
+    final db = await database;
+    final payload = Map<String, Object?>.from(service.toMap());
+    int result;
+    if (service.id == null) {
+      result = await db.insert('service_transactions', payload);
+    } else {
+      result = await db.update(
+        'service_transactions',
+        payload,
+        where: 'id = ?',
+        whereArgs: [service.id],
+      );
+    }
+    _notifyDataChanged();
+    return result;
+  }
+
+  Future<List<ServiceTransaction>> getServiceTransactions({int? storeId}) async {
+    final db = await database;
+    final where = <String>[];
+    final args = <Object?>[];
+    if (storeId != null) {
+      where.add('store_id = ?');
+      args.add(storeId);
+    }
+    final maps = await db.query(
+      'service_transactions',
+      where: where.isNotEmpty ? where.join(' AND ') : null,
+      whereArgs: args.isNotEmpty ? args : null,
+      orderBy: 'created_at DESC',
+    );
+    return maps
+        .map((m) => ServiceTransaction.fromMap(Map<String, dynamic>.from(m)))
+        .toList();
+  }
+
+  Future<int> deleteServiceTransaction(int id) async {
+    final db = await database;
+    final result = await db.delete(
+      'service_transactions',
       where: 'id = ?',
       whereArgs: [id],
     );

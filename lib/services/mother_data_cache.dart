@@ -1,6 +1,7 @@
 import '../models/client.dart';
 import '../models/item.dart';
 import '../models/store.dart';
+import '../utils/meter_fixed_stock_items.dart';
 
 /// In-memory read models for the child **frontend**. The mother app is the server:
 /// authoritative data lives in the mother's DB; this cache only reflects recent
@@ -14,6 +15,7 @@ class MotherDataCache {
   List<Map<String, Object?>> _itemRows = [];
   List<Map<String, Object?>> _storeRows = [];
   List<Map<String, Object?>> _clientRows = [];
+  final Map<int, List<String>> _itemBarcodeAliasesByItemId = {};
 
   bool itemsApplied = false;
   bool storesApplied = false;
@@ -23,6 +25,7 @@ class MotherDataCache {
     _itemRows = [];
     _storeRows = [];
     _clientRows = [];
+    _itemBarcodeAliasesByItemId.clear();
     itemsApplied = false;
     storesApplied = false;
     clientsApplied = false;
@@ -111,13 +114,36 @@ class MotherDataCache {
     clientsApplied = true;
   }
 
+  List<String> _parseAcceptedBarcodesFromRow(Map<dynamic, dynamic> row) {
+    final raw = row['accepted_barcodes'] ?? row['acceptedBarcodes'];
+    if (raw is! List) return const [];
+    return [
+      for (final e in raw)
+        e.toString().trim(),
+    ].where((s) => s.isNotEmpty).toList();
+  }
+
   void applyItemsFromRemote(List<Map<String, dynamic>> rows) {
-    _itemRows = [
-      for (final r in rows)
-        _normalizeItemRow(r),
-    ];
+    _itemBarcodeAliasesByItemId.clear();
+    final normalized = <Map<String, Object?>>[];
+    for (final r in rows) {
+      final map = _normalizeItemRow(r);
+      normalized.add(map);
+      final id = map['id'] as int?;
+      if (id != null && id > 0) {
+        final aliases = _parseAcceptedBarcodesFromRow(r);
+        if (aliases.isNotEmpty) {
+          _itemBarcodeAliasesByItemId[id] = aliases;
+        }
+      }
+    }
+    _itemRows = normalized;
     itemsApplied = true;
   }
+
+  /// Extra product barcodes from mother (`item_barcodes`), keyed by item id.
+  Map<int, List<String>> getItemBarcodeAliasesMap() =>
+      Map<int, List<String>>.from(_itemBarcodeAliasesByItemId);
 
   List<Store> getStores() {
     final list = _storeRows
@@ -174,7 +200,9 @@ class MotherDataCache {
   List<Item> getReorderItems({int? storeId}) {
     return getItems(storeId: storeId)
         .where(
-          (e) => e.stockQty <= e.reorderLevel || e.stockQty <= 0,
+          (e) =>
+              !isMeterSoldFixedStockItemName(e.name) &&
+              (e.stockQty <= e.reorderLevel || e.stockQty <= 0),
         )
         .toList();
   }

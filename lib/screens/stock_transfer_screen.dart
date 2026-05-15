@@ -1,13 +1,14 @@
 import 'package:flutter/material.dart';
 
 import '../models/item.dart';
-import '../services/auth_service.dart';
 import '../services/app_settings_service.dart';
+import '../services/auth_service.dart';
 import '../services/local_db_service.dart';
 import '../services/remote_sync_service.dart';
 import '../utils/number_display.dart';
 import '../utils/text_format.dart';
 import '../widgets/section_page_title.dart';
+import 'item_search_pick_screen.dart';
 import 'stock_transfers_list_screen.dart';
 
 /// Prefer full unit name; fall back to short code only if name is missing.
@@ -119,14 +120,84 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
     return all.where((e) => e.id == null || !used.contains(e.id)).toList();
   }
 
+  void _rebindItemsFromFreshList(List<Item> fresh) {
+    final fromId = _fromItem?.id;
+    if (fromId != null) {
+      for (final e in fresh) {
+        if (e.id == fromId) {
+          _fromItem = e;
+          break;
+        }
+      }
+    }
+    for (final leg in _legs) {
+      final tid = leg.toItem?.id;
+      if (tid == null) continue;
+      for (final e in fresh) {
+        if (e.id == tid) {
+          leg.toItem = e;
+          break;
+        }
+      }
+    }
+  }
+
+  String _itemPickerCaption(Item e) =>
+      '${toTitleCaseWords(e.name)}  •  AV ${formatDisplayNumber(e.stockQty)} ${_itemUnitDisplay(e)}';
+
+  Future<void> _pickFromItem() async {
+    if (_items.isEmpty) return;
+    final choice = await ItemSearchPickScreen.pick(
+      context,
+      title: 'From item (source)',
+      options: _items,
+      selected: _fromItem,
+    );
+    if (!mounted || choice == null) return;
+    setState(() => _fromItem = choice);
+    _syncLegsAfterFromItemChange();
+    _syncFromUnitCostField();
+  }
+
+  Future<void> _pickDestinationItem(int legIndex, _DestinationLeg leg) async {
+    final candidates = _candidatesForLeg(legIndex);
+    final choice = await ItemSearchPickScreen.pick(
+      context,
+      title: 'To item (destination)',
+      options: candidates,
+      selected: leg.toItem,
+    );
+    if (!mounted || choice == null) return;
+    setState(() => leg.toItem = choice);
+    _recomputeLegCost(leg);
+    _prefillLegSellingFromToItem(leg);
+  }
+
   double _parseTotalSourceQty() =>
       double.tryParse(_totalSourceQtyController.text.replaceAll(',', '.')) ??
       0;
 
-  double _fromQtyForLeg() {
-    final total = _parseTotalSourceQty();
-    if (_legs.length <= 1) return total;
-    return total / _legs.length;
+  /// Notes on the primary [stock_transfers] row when several destinations share one source deduction.
+  String? _primaryTransferNotes() {
+    final user = _notesController.text.trim();
+    if (_legs.length <= 1) {
+      return user.isEmpty ? null : user;
+    }
+    final parts = <String>[];
+    for (var i = 1; i < _legs.length; i++) {
+      final leg = _legs[i];
+      final t = leg.toItem;
+      if (t == null) continue;
+      final tq =
+          double.tryParse(leg.toQty.text.replaceAll(',', '.')) ?? 0;
+      parts.add(
+        '${toTitleCaseWords(t.name)} +${formatDisplayNumber(tq)} ${_itemUnitDisplay(t)}',
+      );
+    }
+    if (parts.isEmpty) return user.isEmpty ? null : user;
+    final also = 'Also to: ${parts.join('; ')}';
+    if (user.isEmpty) return also;
+    return '$user\n$also';
   }
 
   double _fromUnitCostForCalc() {
@@ -165,14 +236,14 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
     }
 
     final from = _fromItem;
-    final fromQty = _fromQtyForLeg();
+    final totalSource = _parseTotalSourceQty();
     final toQty = double.tryParse(leg.toQty.text.replaceAll(',', '.')) ?? 0;
     final fromUnitCost = _fromUnitCostForCalc();
-    if (from == null || fromQty <= 0 || toQty <= 0) {
+    if (from == null || totalSource <= 0 || toQty <= 0) {
       leg.toCost.text = '';
       return;
     }
-    final ratio = toQty / fromQty;
+    final ratio = toQty / totalSource;
     if (ratio <= 0) {
       leg.toCost.text = '';
       return;
@@ -385,13 +456,12 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
       }
       seenTo.add(to.id!);
 
-      final fromQty = _fromQtyForLeg();
       final toQty = double.tryParse(leg.toQty.text.replaceAll(',', '.')) ?? 0;
-      if (fromQty <= 0 || toQty <= 0) {
+      if (toQty <= 0) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '$label: enter valid source and destination quantities',
+              '$label: enter a valid destination quantity to add',
             ),
           ),
         );
@@ -451,81 +521,92 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
       return;
     }
 
+    if (!await _auth.isRemoteUser()) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Transfers are saved on the shop (mother) device only. '
+            'Sign in with a remote user linked to the mother app.',
+          ),
+        ),
+      );
+      return;
+    }
+
     setState(() => _saving = true);
     try {
-      final isRemote = await _auth.isRemoteUser();
+      final primaryNotes = _primaryTransferNotes();
+
       for (var i = 0; i < _legs.length; i++) {
         final leg = _legs[i];
         final to = leg.toItem!;
-        final fromQty = _fromQtyForLeg();
         final toQty = double.tryParse(leg.toQty.text.replaceAll(',', '.')) ?? 0;
-        final factor = toQty / fromQty;
         final toCostPrice =
             double.tryParse(leg.toCost.text.replaceAll(',', '.')) ?? 0;
         final toSellingPrice =
             double.tryParse(leg.toSelling.text.replaceAll(',', '.')) ?? 0;
 
-        Item currentFrom = from;
-        if (!isRemote) {
-          final refreshed = await _db.getItems();
-          for (final e in refreshed) {
-            if (e.id == from.id) {
-              currentFrom = e;
-              break;
-            }
+        if (i == 0) {
+          if (from.stockQty < totalSourceQty) {
+            throw StateError(
+              'Not enough source stock. Available: '
+              '${formatDisplayNumber(from.stockQty)}',
+            );
           }
-        }
 
-        if (currentFrom.stockQty < fromQty) {
-          throw StateError(
-            'Destination ${i + 1}: not enough source stock after previous '
-            'transfers. Available: ${formatDisplayNumber(currentFrom.stockQty)}',
-          );
-        }
-
-        if (isRemote) {
+          final factor = toQty / totalSourceQty;
           final remote = await _auth.saveRemoteStockTransfer({
-            'fromItemId': currentFrom.id,
+            'fromItemId': from.id,
             'toItemId': to.id,
-            'fromQuantity': fromQty,
+            'fromQuantity': totalSourceQty,
             'conversionFactor': factor,
-            'toCostPrice': toCostPrice > 0 ? toCostPrice : null,
+            if (toCostPrice > 0) 'toCostPrice': toCostPrice,
             'fromCostPrice': fromUnitCostEntered,
             'toSellingPrice': toSellingPrice,
-            'storeId': currentFrom.storeId ?? to.storeId,
-            'notes': _notesController.text.trim().isEmpty
-                ? null
-                : _notesController.text.trim(),
+            if ((from.storeId ?? to.storeId) != null)
+              'storeId': (from.storeId ?? to.storeId),
+            if (primaryNotes != null) 'notes': primaryNotes,
           });
           if (remote['success'] != true) {
             throw Exception(
-              (remote['message'] ?? 'Failed to sync transfer').toString(),
+              (remote['message'] ?? 'Failed to save transfer on mother')
+                  .toString(),
             );
           }
         } else {
-          await _db.transferStock(
-            fromItemId: currentFrom.id!,
-            toItemId: to.id!,
-            fromQuantity: fromQty,
-            conversionFactor: factor,
-            toCostPrice: toCostPrice > 0 ? toCostPrice : null,
-            toSellingPrice: toSellingPrice,
-            fromCostPrice: fromUnitCostEntered,
-            storeId: currentFrom.storeId ?? to.storeId,
-            notes: _notesController.text.trim().isEmpty
-                ? null
-                : _notesController.text.trim(),
-          );
+          final remote = await _auth.saveRemoteStockTransfer({
+            'destinationOnly': true,
+            'fromItemId': from.id,
+            'toItemId': to.id,
+            'toQuantity': toQty,
+            if (toCostPrice > 0) 'toCostPrice': toCostPrice,
+            'toSellingPrice': toSellingPrice,
+            if ((from.storeId ?? to.storeId) != null)
+              'storeId': (from.storeId ?? to.storeId),
+          });
+          if (remote['success'] != true) {
+            throw Exception(
+              (remote['message'] ?? 'Failed to save transfer on mother')
+                  .toString(),
+            );
+          }
         }
       }
 
+      final fresh = await RemoteSyncService.instance.fetchItems();
       if (!mounted) return;
+      setState(() {
+        _items = fresh;
+        _rebindItemsFromFreshList(fresh);
+      });
+
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
             _legs.length == 1
                 ? 'Transfer completed'
-                : '${_legs.length} transfers completed',
+                : 'Transfer completed (${_legs.length} destinations)',
           ),
         ),
       );
@@ -582,32 +663,26 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    DropdownButtonFormField<Item>(
-                      initialValue: _fromItem,
+                    InputDecorator(
                       decoration: const InputDecoration(
                         labelText: 'From item (source)',
+                        contentPadding: EdgeInsets.zero,
                       ),
-                      isExpanded: true,
-                      items: _items
-                          .map(
-                            (e) => DropdownMenuItem<Item>(
-                              value: e,
-                              child: Text(
-                                '${toTitleCaseWords(e.name)}  •  AV ${formatDisplayNumber(e.stockQty)} ${_itemUnitDisplay(e)}',
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                            ),
-                          )
-                          .toList(),
-                      onChanged: (value) {
-                        if (value == null) return;
-                        setState(() {
-                          _fromItem = value;
-                        });
-                        _syncLegsAfterFromItemChange();
-                        _syncFromUnitCostField();
-                        setState(() {});
-                      },
+                      child: ListTile(
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 0,
+                        ),
+                        title: Text(
+                          _fromItem == null
+                              ? 'Tap to choose'
+                              : _itemPickerCaption(_fromItem!),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: const Icon(Icons.arrow_drop_down),
+                        onTap: _items.isEmpty ? null : _pickFromItem,
+                      ),
                     ),
                     const SizedBox(height: 6),
                     Text(
@@ -639,8 +714,8 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
                             : 'Source quantity to transfer',
                         hintText: 'e.g 1 set, 1 carton, 1 bag',
                         helperText: _legs.length > 1
-                            ? 'Split equally across ${_legs.length} destinations.'
-                            : 'How much to move out of the source item.',
+                            ? 'Source stock decreases once by this total (not divided by number of destinations). Each destination\'s stock increases by its own "Destination quantity to add" below.'
+                            : 'Source stock decreases by this amount. Destination stock increases by the quantity you enter for that item.',
                       ),
                       onChanged: (_) {
                         setState(_recomputeAllLegCosts);
@@ -672,7 +747,7 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Several destinations each receive an equal share of the total above.',
+                      'Each destination receives the quantity you enter for that row. The source is reduced only by the total above.',
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: Colors.black54,
                       ),
@@ -742,43 +817,35 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
                                           ),
                                         ),
                                       ),
-                                    DropdownButtonFormField<Item>(
-                                      key: ValueKey(
-                                        'to_${index}_${leg.toItem?.id}',
-                                      ),
-                                      initialValue: leg.toItem != null &&
-                                              candidates.any(
-                                                (c) => c.id == leg.toItem!.id,
-                                              )
-                                          ? leg.toItem
-                                          : null,
+                                    InputDecorator(
                                       decoration: const InputDecoration(
                                         labelText: 'To item (destination)',
-                                        contentPadding: EdgeInsets.only(
-                                          top: 8,
-                                          bottom: 4,
-                                        ),
+                                        contentPadding: EdgeInsets.zero,
                                       ),
-                                      isExpanded: true,
-                                      items: candidates
-                                          .map(
-                                            (e) => DropdownMenuItem<Item>(
-                                              value: e,
-                                              child: Text(
-                                                '${toTitleCaseWords(e.name)}  •  AV ${formatDisplayNumber(e.stockQty)} ${_itemUnitDisplay(e)}',
-                                                overflow: TextOverflow.ellipsis,
-                                              ),
-                                            ),
-                                          )
-                                          .toList(),
-                                      onChanged: (value) {
-                                        setState(() {
-                                          leg.toItem = value;
-                                        });
-                                        _recomputeLegCost(leg);
-                                        _prefillLegSellingFromToItem(leg);
-                                        setState(() {});
-                                      },
+                                      child: ListTile(
+                                        contentPadding:
+                                            const EdgeInsets.symmetric(
+                                          horizontal: 4,
+                                          vertical: 0,
+                                        ),
+                                        title: Text(
+                                          leg.toItem == null
+                                              ? 'Tap to choose'
+                                              : _itemPickerCaption(
+                                                  leg.toItem!,
+                                                ),
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                        trailing:
+                                            const Icon(Icons.arrow_drop_down),
+                                        onTap: candidates.isEmpty
+                                            ? null
+                                            : () => _pickDestinationItem(
+                                                  index,
+                                                  leg,
+                                                ),
+                                      ),
                                     ),
                                     const SizedBox(height: 12),
                                     TextField(
@@ -792,6 +859,8 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
                                             'Destination quantity to add',
                                         hintText:
                                             'e.g 12 for 1 carton, 24 for 2 cartons',
+                                        helperText:
+                                            'Stock at hand on this destination item increases by this amount.',
                                       ),
                                       onChanged: (_) {
                                         setState(() {
@@ -801,7 +870,7 @@ class _StockTransferScreenState extends State<StockTransferScreen> {
                                     ),
                                     const SizedBox(height: 8),
                                     Text(
-                                      'Destination increase: ${formatDisplayNumber(double.tryParse(leg.toQty.text.replaceAll(',', '.')) ?? 0)} ${_itemUnitDisplay(leg.toItem)}',
+                                      'Stock at hand on this item +${formatDisplayNumber(double.tryParse(leg.toQty.text.replaceAll(',', '.')) ?? 0)} ${_itemUnitDisplay(leg.toItem)}',
                                       style: theme.textTheme.bodySmall
                                           ?.copyWith(
                                         fontWeight: FontWeight.w600,

@@ -216,12 +216,14 @@ class _SaleItemScreenState extends State<SaleItemScreen>
     if (q.isEmpty) return tabItems;
     final rawQ = _searchController.text.trim();
     return tabItems.where((e) {
-      if (itemBarcodeOrSkuMatchesScanned(
-        e.barcode,
-        e.sku,
-        rawQ,
-        acceptedBarcodes: widget.barcodeAliasesByItemId[e.id ?? -1] ?? const [],
-      )) {
+      final aliases = widget.barcodeAliasesByItemId[e.id ?? -1] ?? const [];
+      if (barcodeScanMatchKindForItem(
+            barcode: e.barcode,
+            sku: e.sku,
+            scanned: rawQ,
+            acceptedBarcodes: aliases,
+          ) !=
+          BarcodeScanMatchKind.none) {
         return true;
       }
       final name = e.name.toLowerCase();
@@ -248,17 +250,17 @@ class _SaleItemScreenState extends State<SaleItemScreen>
   }
 
   List<Item> _itemsMatchingBarcode(String scanned) {
-    return widget.items
-        .where(
-          (e) => itemBarcodeOrSkuMatchesScanned(
-            e.barcode,
-            e.sku,
-            scanned,
-            acceptedBarcodes:
-                widget.barcodeAliasesByItemId[e.id ?? -1] ?? const [],
-          ),
-        )
-        .toList();
+    return itemsMatchingBarcodeScan<Item>(
+      widget.items,
+      scanned,
+      (e) => barcodeScanMatchKindForItem(
+        barcode: e.barcode,
+        sku: e.sku,
+        scanned: scanned,
+        acceptedBarcodes:
+            widget.barcodeAliasesByItemId[e.id ?? -1] ?? const [],
+      ),
+    );
   }
 
   int _tabIndexForItem(Item item) {

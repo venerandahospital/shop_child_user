@@ -12,8 +12,10 @@ import '../models/sale_item.dart';
 import '../services/app_settings_service.dart';
 import '../services/local_db_service.dart';
 import '../services/auth_service.dart';
+import '../services/mother_data_cache.dart';
 import '../services/remote_sync_service.dart';
 import '../utils/barcode_utils.dart';
+import '../utils/meter_fixed_stock_items.dart';
 import '../utils/number_display.dart';
 import '../utils/text_format.dart';
 import '../widgets/section_page_title.dart';
@@ -128,6 +130,13 @@ class _SalesScreenState extends State<SalesScreen> {
     return sale == 'service';
   }
 
+  bool _isMeterFixedStockItem(Item item) =>
+      isMeterSoldFixedStockItemName(item.name);
+
+  /// Service lines or fixed-stock items (Ekiveera, carpet, ebinyobwa): no cap from [Item.stockQty].
+  bool _lineIgnoresStockOnHand(Item item) =>
+      _isServiceSaleItem(item) || _isMeterFixedStockItem(item);
+
   String _saleCategoryLabel(Item item) {
     final raw = (item.category ?? '').trim();
     if (raw.isEmpty) return '';
@@ -145,11 +154,11 @@ class _SalesScreenState extends State<SalesScreen> {
         ? await RemoteSyncService.instance.fetchItems()
         : await _db.getItems();
     items.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    Map<int, List<String>> aliases = const {};
-    if (!isRemote) {
-      final ids = items.map((e) => e.id).whereType<int>();
-      aliases = await _db.getItemBarcodesMap(itemIds: ids);
-    }
+    final Map<int, List<String>> aliases = isRemote
+        ? MotherDataCache.instance.getItemBarcodeAliasesMap()
+        : await _db.getItemBarcodesMap(
+            itemIds: items.map((e) => e.id).whereType<int>(),
+          );
     if (!mounted) return;
     setState(() {
       _items = items;
@@ -174,7 +183,8 @@ class _SalesScreenState extends State<SalesScreen> {
   Future<void> _refreshSaleData() async {
     setState(() => _refreshing = true);
     try {
-      await _auth.testConnectionWithFallback();
+      await _auth.connectViaSavedUrls() ??
+          (await _auth.testConnectionWithFallback()).$3;
       await Future.wait([_loadItems(), _loadClients()]);
     } finally {
       if (mounted) {
@@ -603,7 +613,7 @@ class _SalesScreenState extends State<SalesScreen> {
   Future<void> _addToCart({double? forcedQty, double? forcedProductDiscount}) async {
     if (_selectedItem == null) return;
     final selectedItem = _selectedItem!;
-    final isService = _isServiceSaleItem(selectedItem);
+    final skipStockCap = _lineIgnoresStockOnHand(selectedItem);
 
     final qty =
         forcedQty ?? (double.tryParse(_qtyController.text.replaceAll(',', '.')) ?? 0);
@@ -614,7 +624,7 @@ class _SalesScreenState extends State<SalesScreen> {
       ).showSnackBar(const SnackBar(content: Text('Enter a valid quantity')));
       return;
     }
-    if (!isService) {
+    if (!skipStockCap) {
       // Ensure we don't exceed available stock for this item
       final currentQtyForItem = _cart
           .where((e) => e.item.id == selectedItem.id)
@@ -674,7 +684,7 @@ class _SalesScreenState extends State<SalesScreen> {
         );
         return;
       }
-      if (!_isServiceSaleItem(entry.item) && entry.quantity > entry.item.stockQty) {
+      if (!_lineIgnoresStockOnHand(entry.item) && entry.quantity > entry.item.stockQty) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
@@ -894,16 +904,16 @@ class _SalesScreenState extends State<SalesScreen> {
   }
 
   List<Item> _itemsMatchingBarcode(String scanned) {
-    return _items
-        .where(
-          (e) => itemBarcodeOrSkuMatchesScanned(
-            e.barcode,
-            e.sku,
-            scanned,
-            acceptedBarcodes: _itemBarcodeAliases[e.id ?? -1] ?? const [],
-          ),
-        )
-        .toList();
+    return itemsMatchingBarcodeScan<Item>(
+      _items,
+      scanned,
+      (e) => barcodeScanMatchKindForItem(
+        barcode: e.barcode,
+        sku: e.sku,
+        scanned: scanned,
+        acceptedBarcodes: _itemBarcodeAliases[e.id ?? -1] ?? const [],
+      ),
+    );
   }
 
   Future<void> _openBarcodeScannerFromSalePage() async {
@@ -928,8 +938,27 @@ class _SalesScreenState extends State<SalesScreen> {
     final trimmed = code.trim();
     if (trimmed.isEmpty) return;
     final matches = _itemsMatchingBarcode(trimmed);
+    final usedPartialMatch = matches.isNotEmpty &&
+        barcodeScanMatchKindForItem(
+              barcode: matches.first.barcode,
+              sku: matches.first.sku,
+              scanned: trimmed,
+              acceptedBarcodes:
+                  _itemBarcodeAliases[matches.first.id ?? -1] ?? const [],
+            ) ==
+            BarcodeScanMatchKind.fuzzy;
     if (matches.length == 1) {
       final item = matches.first;
+      if (usedPartialMatch && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Matched from a partial barcode scan — check the item is correct.',
+            ),
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
       setState(() {
         _selectedItem = item;
         if (_isAllReceived) {
@@ -1042,7 +1071,9 @@ class _SalesScreenState extends State<SalesScreen> {
     final currentQty = _cart
         .where((e) => e.item.id == _selectedItem!.id)
         .fold<double>(0, (sum, e) => sum + e.quantity);
-    final maxAvailable = _selectedItem!.stockQty - currentQty;
+    final maxAvailable = _isMeterFixedStockItem(_selectedItem!)
+        ? 1e12
+        : (_selectedItem!.stockQty - currentQty);
     final result = await Navigator.of(context).push<Map<String, String>>(
       MaterialPageRoute<Map<String, String>>(
         builder: (context) => SaleQuantityScreen(
@@ -1086,7 +1117,8 @@ class _SalesScreenState extends State<SalesScreen> {
         builder: (context) => SaleQuantityScreen(
           item: entry.item,
           cartTotal: baseCartTotal,
-          maxAvailable: entry.item.stockQty,
+          maxAvailable:
+              _isMeterFixedStockItem(entry.item) ? 1e12 : entry.item.stockQty,
           initialQuantity: _fmtCompactNumber(entry.quantity),
           initialProductDiscount:
               entry.productDiscount > 0 ? _fmtCompactNumber(entry.productDiscount) : '',
@@ -1104,7 +1136,8 @@ class _SalesScreenState extends State<SalesScreen> {
       );
       return;
     }
-    final stockCap = entry.item.stockQty;
+    final stockCap =
+        _isMeterFixedStockItem(entry.item) ? 1e12 : entry.item.stockQty;
     if (newQty > stockCap) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1240,44 +1273,58 @@ class _SalesScreenState extends State<SalesScreen> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
                     child: Card(
                       elevation: 2,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(18),
                       ),
                       child: Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+                        padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
                         child: Column(
                           mainAxisSize: MainAxisSize.min,
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
                       if (!kIsWeb) ...[
                         Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                          padding: const EdgeInsets.symmetric(horizontal: 2),
+                          child: Row(
                             children: [
-                              FilledButton.icon(
-                                onPressed: _items.isEmpty
-                                    ? null
-                                    : _openBarcodeScannerFromSalePage,
-                                icon: const Icon(Icons.qr_code_scanner),
-                                label:
-                                    const Text('Scan barcode with phone camera'),
-                                style: FilledButton.styleFrom(
-                                  padding:
-                                      const EdgeInsets.symmetric(vertical: 14),
-                                  backgroundColor: const Color(0xFF2563EB),
-                                  foregroundColor: Colors.white,
+                              Expanded(
+                                child: FilledButton.icon(
+                                  onPressed: _items.isEmpty
+                                      ? null
+                                      : _openBarcodeScannerFromSalePage,
+                                  icon: const Icon(
+                                    Icons.qr_code_scanner,
+                                    size: 20,
+                                  ),
+                                  label: const Text('Scan barcode'),
+                                  style: FilledButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 10,
+                                      horizontal: 6,
+                                    ),
+                                    backgroundColor: const Color(0xFF2563EB),
+                                    foregroundColor: Colors.white,
+                                  ),
                                 ),
                               ),
-                              TextButton(
-                                onPressed:
-                                    _items.isEmpty ? null : () => _openItemPage(),
-                                child: const Text(
-                                  'Pick from list instead',
-                                  style: TextStyle(fontSize: 14),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: OutlinedButton.icon(
+                                  onPressed: _items.isEmpty
+                                      ? null
+                                      : () => _openItemPage(),
+                                  icon: const Icon(Icons.list, size: 20),
+                                  label: const Text('Pick from list'),
+                                  style: OutlinedButton.styleFrom(
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 10,
+                                      horizontal: 6,
+                                    ),
+                                    visualDensity: VisualDensity.compact,
+                                  ),
                                 ),
                               ),
                             ],

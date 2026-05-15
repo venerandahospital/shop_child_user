@@ -5,8 +5,10 @@ import '../models/item.dart';
 import '../services/auth_service.dart';
 import '../services/app_settings_service.dart';
 import '../services/local_db_service.dart';
+import '../services/mother_data_cache.dart';
 import '../services/remote_sync_service.dart';
 import '../utils/barcode_utils.dart';
+import '../utils/meter_fixed_stock_items.dart';
 import 'barcode_scan_screen.dart';
 import 'stock_receipts_list_screen.dart';
 import '../utils/number_display.dart';
@@ -74,11 +76,11 @@ class _ReceiveStockScreenState extends State<ReceiveStockScreen> {
         ? await RemoteSyncService.instance.fetchItems()
         : await _db.getItems();
     items.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-    Map<int, List<String>> aliases = const {};
-    if (!isRemote) {
-      final ids = items.map((e) => e.id).whereType<int>();
-      aliases = await _db.getItemBarcodesMap(itemIds: ids);
-    }
+    final Map<int, List<String>> aliases = isRemote
+        ? MotherDataCache.instance.getItemBarcodeAliasesMap()
+        : await _db.getItemBarcodesMap(
+            itemIds: items.map((e) => e.id).whereType<int>(),
+          );
     if (!mounted) return;
     Item? selected;
     if (items.isNotEmpty) {
@@ -117,27 +119,52 @@ class _ReceiveStockScreenState extends State<ReceiveStockScreen> {
     if (!mounted || scanned == null) return;
     final code = scanned.trim();
     if (code.isEmpty) return;
-    final matched = _items.where((item) {
-      return itemBarcodeOrSkuMatchesScanned(
-        item.barcode,
-        item.sku,
-        code,
+    final matched = itemsMatchingBarcodeScan<Item>(
+      _items,
+      code,
+      (item) => barcodeScanMatchKindForItem(
+        barcode: item.barcode,
+        sku: item.sku,
+        scanned: code,
         acceptedBarcodes: _itemBarcodeAliases[item.id ?? -1] ?? const [],
-      );
-    }).toList();
+      ),
+    );
     if (matched.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('No item found for scanned barcode/SKU.')),
       );
       return;
     }
+    if (matched.length > 1) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Several items match this scan. Choose the correct item from the list.',
+          ),
+        ),
+      );
+      return;
+    }
     final item = matched.first;
+    final partial = barcodeScanMatchKindForItem(
+          barcode: item.barcode,
+          sku: item.sku,
+          scanned: code,
+          acceptedBarcodes: _itemBarcodeAliases[item.id ?? -1] ?? const [],
+        ) ==
+        BarcodeScanMatchKind.fuzzy;
     setState(() {
       _selectedItem = item;
       _sellingPriceController.text = formatMoney(item.sellingPrice);
     });
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Selected item: ${item.name}')),
+      SnackBar(
+        content: Text(
+          partial
+              ? 'Selected ${item.name} (partial barcode match — please verify).'
+              : 'Selected item: ${item.name}',
+        ),
+      ),
     );
   }
 
@@ -410,6 +437,18 @@ class _ReceiveStockScreenState extends State<ReceiveStockScreen> {
                             color: Colors.grey[700],
                           ),
                         ),
+                      if (item != null &&
+                          isMeterSoldFixedStockItemName(item.name)) ...[
+                        const SizedBox(height: 10),
+                        Text(
+                          'Metre item (Ekiveera / carpet / ebinyobwa): stock at hand stays at 1. '
+                          'Enter metres or units received for this receipt (used for cost and history only).',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            fontWeight: FontWeight.w600,
+                            color: Colors.grey[800],
+                          ),
+                        ),
+                      ],
                       const SizedBox(height: 16),
                       TextField(
                         controller: _qtyController,

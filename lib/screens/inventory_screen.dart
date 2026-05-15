@@ -7,6 +7,7 @@ import '../models/item.dart';
 import '../services/auth_service.dart';
 import '../services/app_settings_service.dart';
 import '../services/local_db_service.dart';
+import '../services/mother_data_cache.dart';
 import '../services/remote_sync_service.dart';
 import '../utils/barcode_utils.dart';
 import '../utils/number_display.dart';
@@ -87,11 +88,11 @@ class _InventoryScreenState extends State<InventoryScreen>
     final items = isRemote
         ? await RemoteSyncService.instance.fetchItems()
         : await _db.getItems();
-    Map<int, List<String>> aliases = const {};
-    if (!isRemote) {
-      final ids = items.map((e) => e.id).whereType<int>();
-      aliases = await _db.getItemBarcodesMap(itemIds: ids);
-    }
+    final Map<int, List<String>> aliases = isRemote
+        ? MotherDataCache.instance.getItemBarcodeAliasesMap()
+        : await _db.getItemBarcodesMap(
+            itemIds: items.map((e) => e.id).whereType<int>(),
+          );
     items.sort((a, b) => b.createdAt.compareTo(a.createdAt));
     if (!mounted) return;
     setState(() {
@@ -211,12 +212,14 @@ class _InventoryScreenState extends State<InventoryScreen>
       final sku = (item.sku ?? '').toLowerCase();
       final barcode = (item.barcode ?? '').toLowerCase();
       final category = (item.category ?? '').toLowerCase();
-      if (itemBarcodeOrSkuMatchesScanned(
-        item.barcode,
-        item.sku,
-        trimmed,
-        acceptedBarcodes: _itemBarcodeAliases[item.id ?? -1] ?? const [],
-      )) {
+      if (barcodeScanMatchKindForItem(
+            barcode: item.barcode,
+            sku: item.sku,
+            scanned: trimmed,
+            acceptedBarcodes:
+                _itemBarcodeAliases[item.id ?? -1] ?? const [],
+          ) !=
+          BarcodeScanMatchKind.none) {
         return true;
       }
       return name.contains(query) ||
@@ -742,6 +745,12 @@ class _InventoryScreenState extends State<InventoryScreen>
                                       spacing: 6,
                                       runSpacing: 6,
                                       children: [
+                                        if ((item.shelfNumber ?? '').trim().isNotEmpty)
+                                          _statusChip(
+                                            context,
+                                            'Shelf ${item.shelfNumber!.trim()}',
+                                            Colors.teal,
+                                          ),
                                         if (!isServiceItem) ...[
                                           _stockStatusChip(
                                             context,

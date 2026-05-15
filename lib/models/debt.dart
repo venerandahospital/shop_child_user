@@ -27,7 +27,7 @@ class Debt {
       phone: map['phone'] as String?,
       address: map['address'] as String?,
       amount: (map['amount'] as num?)?.toDouble() ?? 0,
-      isPaid: (map['is_paid'] as int? ?? 0) == 1,
+      isPaid: map['is_paid'] == true || (map['is_paid'] as int? ?? 0) == 1,
       createdAt: DateTime.tryParse(map['created_at'] as String? ?? '') ??
           DateTime.now(),
     );

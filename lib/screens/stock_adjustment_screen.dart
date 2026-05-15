@@ -6,6 +6,7 @@ import '../services/auth_service.dart';
 import '../services/local_db_service.dart';
 import '../services/remote_sync_service.dart';
 import '../utils/number_display.dart';
+import '../utils/meter_fixed_stock_items.dart';
 import '../utils/text_format.dart';
 import '../widgets/section_page_title.dart';
 import 'stock_receipts_list_screen.dart';
@@ -127,7 +128,9 @@ class _StockAdjustmentScreenState extends State<StockAdjustmentScreen> {
       );
       return;
     }
-    if (_type == _AdjustmentType.remove && qty > item.stockQty) {
+    if (_type == _AdjustmentType.remove &&
+        !isMeterSoldFixedStockItemName(item.name) &&
+        qty > item.stockQty) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
