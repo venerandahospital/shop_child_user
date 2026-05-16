@@ -5,6 +5,7 @@ import 'dart:async';
 import 'auth_service.dart';
 import 'mother_data_cache.dart';
 import '../models/asset.dart';
+import '../models/cart_draft.dart';
 import '../models/client.dart';
 import '../models/debt.dart';
 import '../models/debt_payment.dart';
@@ -227,6 +228,14 @@ class RemoteSyncService {
     final res = await _auth.getRemoteAuthorized(path: '/expenses');
     if (res['success'] != true) return <Expense>[];
     return _extractRows(res).map(Expense.fromMap).toList();
+  }
+
+  Future<List<CartDraft>> fetchCartDrafts() async {
+    final res = await _auth.getRemoteAuthorized(path: '/cart-drafts');
+    if (res['success'] != true) return <CartDraft>[];
+    return _extractRows(res)
+        .map((e) => CartDraft.fromRemoteJson(Map<String, dynamic>.from(e)))
+        .toList();
   }
 
   Future<List<Asset>> fetchAssets() async {

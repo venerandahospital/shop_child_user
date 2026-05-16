@@ -1609,6 +1609,21 @@ class AuthService {
     );
   }
 
+  Future<Map<String, dynamic>> saveRemoteCartDraft(Map<String, dynamic> payload) {
+    return postRemoteAuthorized(path: '/cart-drafts', body: payload);
+  }
+
+  Future<Map<String, dynamic>> deleteRemoteCartDraft(int id) {
+    return postRemoteAuthorized(
+      path: '/cart-drafts/delete',
+      body: {'id': id},
+    );
+  }
+
+  Future<Map<String, dynamic>> deleteAllRemoteCartDrafts() {
+    return postRemoteAuthorized(path: '/cart-drafts/delete-all', body: {});
+  }
+
   Future<Map<String, dynamic>> fetchRemoteDashboardAnalytics({
     String range = 'today',
   }) {

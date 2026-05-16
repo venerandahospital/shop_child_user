@@ -3275,4 +3275,8 @@ class LocalDbService {
     );
   }
 
+  Future<void> deleteAllCartDrafts() async {
+    final db = await database;
+    await db.delete('cart_drafts');
+  }
 }

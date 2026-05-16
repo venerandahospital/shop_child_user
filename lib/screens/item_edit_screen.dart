@@ -152,40 +152,18 @@ class _ItemEditScreenState extends State<ItemEditScreen> {
       return;
     }
 
-    final existingItems = await _loadItemsForBarcodeChecks();
-    final conflictInLoaded = existingItems.firstWhere(
-      (item) =>
-          !_isSameItemRecord(item, widget.item) &&
-          (_norm(item.sku) == normalized || _norm(item.barcode) == normalized),
-      orElse: () => Item(name: ''),
-    );
-    if (conflictInLoaded.name.trim().isNotEmpty) {
+    final owner =
+        await _findItemOwningBarcode(trimmed, excluding: widget.item);
+    if (owner != null) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Code "$trimmed" is already used by item "${conflictInLoaded.name}".',
+            'Code "$trimmed" is already used by item "${owner.name}".',
           ),
         ),
       );
       return;
-    }
-
-    if (!await _auth.isRemoteUser()) {
-      final localConflict = await _db.findItemByAnyCode(
-        trimmed,
-        excludingItemId: widget.item?.id,
-      );
-      if (localConflict != null && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Code "$trimmed" is already used by item "${localConflict.name}".',
-            ),
-          ),
-        );
-        return;
-      }
     }
 
     final merged = _db.normalizeBarcodeList([...current, trimmed]);
@@ -279,6 +257,61 @@ class _ItemEditScreenState extends State<ItemEditScreen> {
       return RemoteSyncService.instance.fetchItems();
     }
     return _db.getItems();
+  }
+
+  /// Resolves SKU, primary barcode, and accepted (alias) barcodes across items.
+  Item? _findItemOwningBarcodeInMemory(
+    String code, {
+    required List<Item> items,
+    required Map<int, List<String>> aliasesById,
+    Item? excluding,
+    int? excludeId,
+  }) {
+    final trimmed = code.trim();
+    if (trimmed.isEmpty) return null;
+    final normalized = _norm(trimmed);
+    if (normalized.isEmpty) return null;
+
+    final exId = excludeId ?? excluding?.id;
+
+    for (final item in items) {
+      if (item.id == exId || _isSameItemRecord(item, excluding)) continue;
+      if (_norm(item.sku) == normalized || _norm(item.barcode) == normalized) {
+        return item;
+      }
+      final id = item.id;
+      if (id == null || id <= 0) continue;
+      for (final alias in aliasesById[id] ?? const []) {
+        if (_norm(alias) == normalized) return item;
+      }
+    }
+    return null;
+  }
+
+  Future<Item?> _findItemOwningBarcode(
+    String code, {
+    Item? excluding,
+    List<Item>? itemsCache,
+    Map<int, List<String>>? aliasesCache,
+  }) async {
+    final items = itemsCache ?? await _loadItemsForBarcodeChecks();
+    Map<int, List<String>> aliasesById;
+    if (aliasesCache != null) {
+      aliasesById = aliasesCache;
+    } else if (await _auth.isRemoteUser()) {
+      aliasesById = MotherDataCache.instance.getItemBarcodeAliasesMap();
+    } else {
+      aliasesById = await _db.getItemBarcodesMap(
+        itemIds: items.map((e) => e.id).whereType<int>(),
+      );
+    }
+    return _findItemOwningBarcodeInMemory(
+      code,
+      items: items,
+      aliasesById: aliasesById,
+      excluding: excluding,
+      excludeId: excluding?.id,
+    );
   }
 
   Future<void> _applyItemAliasBarcodes(
@@ -1017,7 +1050,7 @@ class _ItemEditScreenState extends State<ItemEditScreen> {
     if (isMeterSoldFixedStockItemName(itemName)) {
       resolvedStock = isNewItem
           ? kSpecialItemUnavailableStock
-          : (base!.stockQty > 0
+          : (base.stockQty > 0
               ? kSpecialItemAvailableStock
               : kSpecialItemUnavailableStock);
     }
@@ -1029,8 +1062,17 @@ class _ItemEditScreenState extends State<ItemEditScreen> {
         _isEditingItem ? '' : _skuController.text.trim();
     final shelfNumber = _shelfNumberController.text.trim();
 
-    List<Item> existingItems = const [];
-    existingItems = await _loadItemsForBarcodeChecks();
+    List<Item> existingItems = await _loadItemsForBarcodeChecks();
+
+    Map<int, List<String>> aliasesForCheck;
+    if (await _auth.isRemoteUser()) {
+      aliasesForCheck = MotherDataCache.instance.getItemBarcodeAliasesMap();
+    } else {
+      aliasesForCheck = await _db.getItemBarcodesMap(
+        itemIds: existingItems.map((e) => e.id).whereType<int>(),
+      );
+    }
+
     final allCodesToValidate = _isEditingItem
         ? enteredBarcodes
         : [
@@ -1038,30 +1080,37 @@ class _ItemEditScreenState extends State<ItemEditScreen> {
             ...enteredBarcodes,
           ];
     String? conflictingCode;
+    Item? conflictingOwner;
     for (final code in allCodesToValidate) {
-      final normalized = _norm(code);
+      final trimmed = code.trim();
+      final normalized = _norm(trimmed);
       if (normalized.isEmpty) continue;
       if (_isEditingItem && _isPrimaryCodeOfThisItem(code)) continue;
-      final usedByOtherItem = existingItems.any(
-        (e) =>
-            !_isSameItemRecord(e, base) &&
-            (_norm(e.sku) == normalized || _norm(e.barcode) == normalized),
+
+      final owner = _findItemOwningBarcodeInMemory(
+        trimmed,
+        items: existingItems,
+        aliasesById: aliasesForCheck,
+        excluding: base,
+        excludeId: base?.id,
       );
-      if (usedByOtherItem) {
-        conflictingCode = code.trim();
+      if (owner != null) {
+        conflictingCode = trimmed;
+        conflictingOwner = owner;
         break;
       }
     }
-    conflictingCode ??= await _db.findConflictingBarcode(
-      allCodesToValidate,
-      excludingItemId: base?.id,
-    );
     if (conflictingCode != null) {
       if (!mounted) return;
       setState(() => _saving = false);
+      final otherName = conflictingOwner?.name.trim() ?? '';
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Code "$conflictingCode" is already used by another item.'),
+          content: Text(
+            otherName.isNotEmpty
+                ? 'Code "$conflictingCode" is already used by item "$otherName".'
+                : 'Code "$conflictingCode" is already used by another item.',
+          ),
         ),
       );
       return;

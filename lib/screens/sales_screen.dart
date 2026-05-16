@@ -344,7 +344,17 @@ class _SalesScreenState extends State<SalesScreen> {
     }
     final json = jsonEncode(payloadMap);
     try {
-      await _db.insertCartDraft(title: title, payloadJson: json);
+      if (await _auth.isRemoteUser()) {
+        final remote = await _auth.saveRemoteCartDraft({
+          'title': title,
+          'payload': json,
+        });
+        if (remote['success'] != true) {
+          throw Exception((remote['message'] ?? 'Failed to save draft on mother').toString());
+        }
+      } else {
+        await _db.insertCartDraft(title: title, payloadJson: json);
+      }
       if (!mounted) return;
       _showDraftSnack('Draft saved: $title');
     } catch (e) {
